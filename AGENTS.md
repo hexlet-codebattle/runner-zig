@@ -1,7 +1,7 @@
 # Code Execution HTTP Service
 
 ## Overview
-This service accepts source code and optional test/checker data over HTTP, executes the code in an isolated filesystem jail, and returns the execution result. It is designed to be fast, stateless, and container-friendly.
+This service accepts source code and optional test/checker data over HTTP, executes the code in a temporary workspace copy, and returns the execution result. It is designed to be fast, stateless, and container-friendly.
 
 ## HTTP API
 
@@ -25,16 +25,19 @@ Response JSON:
 ### `GET /health`
 Returns HTTP 200 when the service is ready.
 
+### `POST /shutdown`
+Sets a shutdown flag and returns HTTP 200 when `ALLOW_SHUTDOWN` is enabled.
+
 ## Execution Flow
-1. Validate request parameters.
-2. Create a temporary filesystem jail using an overlay of the current root.
+1. Validate request parameters (reject non-identity content-encoding and oversized bodies).
+2. Create a temporary directory under `/tmp` and copy the current workspace into it.
 3. Write input files into a language-specific working directory:
    - `solution_text` → language-specific filename (e.g. `solution.py`, `Solution.java`).
    - `checker_text` (if provided) → language-specific checker file.
    - `asserts` (if provided) → `asserts.json`.
-4. Execute `make test` inside the jail.
+4. Execute the test command resolved from `make -n test` via `sh -c` in the temp workspace.
 5. Enforce timeout; on expiration, terminate the process group.
-6. Capture `stdout` and `stderr` and return them with the exit code.
+6. Capture `stdout` and `stderr`; if either stream exceeds 1MB, return an error.
 
 ## Files and Layout Expectations
 The service runs `make test` in its working directory. That directory is expected to contain language-specific runner logic. The service writes files into a subdirectory:
@@ -63,11 +66,25 @@ Filename mapping and checker requirement:
 - `zig`: `solution.zig` + `checker.zig` (checker required)
 - `ts`: `solution.js` (no checker)
 
+## Configuration
+Environment variables:
+- `PORT` (default `4040`): Listener port.
+- `ALLOW_SHUTDOWN` (default `false`): Enable the `/shutdown` endpoint when set to `1` or `true`.
+- `RUN_CONCURRENCY` (default `10`): Max concurrent `/run` handlers; requests return 429 when busy.
+- `RUN_INPUT_MAX` (default `1048576` bytes): Max request body size.
+- `RUN_OUTPUT_MAX` (default `1048576` bytes): Max bytes allowed per stream (0 disables the limit).
+- `DEBUG` (default `false`): Enable request header logging; empty value enables it too.
+
+## Timeout Rules
+`timeout` accepts a string with units: `ms`, `s`, or `m` (defaults to `30s` when omitted).
+
+## Payload Limits
+- Request body limit: `RUN_INPUT_MAX` (HTTP 413 on overflow).
+- Output limit: `RUN_OUTPUT_MAX` per stream (HTTP 413 when exceeded).
+
 ## Isolation and Safety
-- The execution occurs in a chrooted directory backed by an overlay filesystem.
-- On Linux, it creates new namespaces (filesystem, file descriptors, mount, network) before chrooting.
+- The execution occurs in a temporary directory under `/tmp` built by copying the current workspace.
 - The service runs commands in a separate process group for reliable termination.
 
 ## Runtime Notes
-- If the process is PID 1 (container init), it spawns a child and acts as a signal reaper to avoid zombie processes.
-- The service is stateless; each request creates a fresh jail and cleans it up after execution.
+- The service is stateless; each request creates a fresh temp workspace and cleans it up after execution.

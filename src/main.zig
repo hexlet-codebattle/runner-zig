@@ -39,9 +39,11 @@ pub fn main() !void {
     const port = try resolvePort(allocator);
     const allow_shutdown = resolveAllowShutdown(allocator);
     const run_concurrency = resolveRunConcurrency(allocator);
+    const input_max = resolveInputMax(allocator);
     const output_max = resolveOutputMax(allocator);
     const debug_enabled = resolveDebugEnabled(allocator);
-    var state = ServerState.init(allow_shutdown, run_concurrency, output_max, debug_enabled);
+    const runner_cmd = try resolveRunnerCmd(allocator);
+    var state = ServerState.init(allow_shutdown, run_concurrency, input_max, output_max, debug_enabled, runner_cmd);
 
     try serve(allocator, port, &state);
 }
@@ -50,21 +52,27 @@ pub const ServerState = struct {
     allow_shutdown: bool,
     shutdown: std.atomic.Value(bool),
     semaphore: std.Thread.Semaphore,
+    input_max: usize,
     output_max: usize,
     debug_enabled: bool,
+    runner_cmd: RunnerCmd,
 
     pub fn init(
         allow_shutdown: bool,
         run_concurrency: usize,
+        input_max: usize,
         output_max: usize,
         debug_enabled: bool,
+        runner_cmd: RunnerCmd,
     ) ServerState {
         return .{
             .allow_shutdown = allow_shutdown,
             .shutdown = std.atomic.Value(bool).init(false),
             .semaphore = .{ .permits = run_concurrency },
+            .input_max = input_max,
             .output_max = output_max,
             .debug_enabled = debug_enabled,
+            .runner_cmd = runner_cmd,
         };
     }
 };
@@ -146,14 +154,23 @@ fn resolveAllowShutdown(allocator: Allocator) bool {
 fn resolveRunConcurrency(allocator: Allocator) usize {
     if (std.process.getEnvVarOwned(allocator, "RUN_CONCURRENCY")) |value| {
         defer allocator.free(value);
-        return std.fmt.parseUnsigned(usize, value, 10) catch 10;
+        return std.fmt.parseUnsigned(usize, value, 16) catch 16;
     } else |_| {
-        return 10;
+        return 16;
     }
 }
 
 fn resolveOutputMax(allocator: Allocator) usize {
     if (std.process.getEnvVarOwned(allocator, "RUN_OUTPUT_MAX")) |value| {
+        defer allocator.free(value);
+        return std.fmt.parseUnsigned(usize, value, 10) catch 1024 * 1024;
+    } else |_| {
+        return 1024 * 1024;
+    }
+}
+
+fn resolveInputMax(allocator: Allocator) usize {
+    if (std.process.getEnvVarOwned(allocator, "RUN_INPUT_MAX")) |value| {
         defer allocator.free(value);
         return std.fmt.parseUnsigned(usize, value, 10) catch 1024 * 1024;
     } else |_| {
@@ -168,6 +185,65 @@ fn resolveDebugEnabled(allocator: Allocator) bool {
         return !(std.mem.eql(u8, value, "0") or std.mem.eql(u8, value, "false"));
     } else |_| {
         return false;
+    }
+}
+
+const RunnerCmd = struct {
+    raw: []const u8,
+    argv: []const []const u8,
+};
+
+fn resolveRunnerCmd(allocator: Allocator) !RunnerCmd {
+    var child = std.process.Child.init(&[_][]const u8{ "make", "-n", "test" }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    try child.spawn();
+
+    var stdout: std.ArrayList(u8) = .empty;
+    defer stdout.deinit(allocator);
+    var stderr: std.ArrayList(u8) = .empty;
+    defer stderr.deinit(allocator);
+
+    try readAllIntoList(allocator, child.stdout.?, &stdout);
+    try readAllIntoList(allocator, child.stderr.?, &stderr);
+
+    const term = try child.wait();
+    switch (term) {
+        .Exited => |code| {
+            if (code != 0) {
+                if (stderr.items.len > 0) {
+                    std.log.err("make -n test failed: {s}", .{stderr.items});
+                }
+                return error.MakeDryRunFailed;
+            }
+        },
+        else => {
+            if (stderr.items.len > 0) {
+                std.log.err("make -n test failed: {s}", .{stderr.items});
+            }
+            return error.MakeDryRunFailed;
+        },
+    }
+
+    const trimmed = std.mem.trim(u8, stdout.items, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidRunnerCmd;
+
+    const raw = try allocator.dupe(u8, trimmed);
+    const argv = try allocator.alloc([]const u8, 3);
+    argv[0] = "sh";
+    argv[1] = "-c";
+    argv[2] = raw;
+    return .{ .raw = raw, .argv = argv };
+}
+
+fn readAllIntoList(allocator: Allocator, file: std.fs.File, list: *std.ArrayList(u8)) !void {
+    var buf: [8192]u8 = undefined;
+    while (true) {
+        const n = try file.read(&buf);
+        if (n == 0) break;
+        try list.appendSlice(allocator, buf[0..n]);
     }
 }
 
@@ -192,7 +268,6 @@ fn handleRequest(allocator: Allocator, req: *std.http.Server.Request, state: *Se
 }
 
 fn handleRun(allocator: Allocator, req: *std.http.Server.Request, state: *ServerState) !void {
-    const max_body = 5 * 1024 * 1024;
     if (state.debug_enabled) {
         std.log.info("request headers: method={s} target={s} content_type={s} transfer_encoding={s} content_encoding={s} content_length={any}", .{
             @tagName(req.head.method),
@@ -212,7 +287,7 @@ fn handleRun(allocator: Allocator, req: *std.http.Server.Request, state: *Server
         try sendJson(req, .unsupported_media_type, "{\"error\":\"content-encoding not supported\"}");
         return;
     }
-    const body = body_reader.allocRemaining(allocator, .limited(max_body)) catch |err| switch (err) {
+    const body = readBodyLimited(allocator, body_reader, state.input_max) catch |err| switch (err) {
         error.StreamTooLong => {
             try sendJson(req, .payload_too_large, "{\"error\":\"payload too large\"}");
             return;
@@ -260,9 +335,17 @@ fn handleRun(allocator: Allocator, req: *std.http.Server.Request, state: *Server
     defer state.semaphore.post();
 
     const start_ns = std.time.nanoTimestamp();
-    const result = runInTemp(allocator, lang, data, timeout_ns, state.output_max) catch |err| {
-        std.log.err("run failed: {s}", .{@errorName(err)});
-        return err;
+    const result = runInTemp(allocator, lang, data, timeout_ns, state.output_max, state.runner_cmd.argv) catch |err| {
+        switch (err) {
+            error.OutputTooLarge => {
+                try sendJson(req, .payload_too_large, "{\"error\":\"output too large\"}");
+                return;
+            },
+            else => {
+                std.log.err("run failed: {s}", .{@errorName(err)});
+                return err;
+            },
+        }
     };
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
@@ -279,7 +362,7 @@ fn handleRun(allocator: Allocator, req: *std.http.Server.Request, state: *Server
     defer allocator.free(json_body);
 
     const elapsed_ns = @as(u64, @intCast(std.time.nanoTimestamp() - start_ns));
-    std.log.info("run complete: lang={s} timeout={s} body_bytes={d} make_test_ms={d} response_bytes={d}", .{
+    std.log.info("run complete: lang={s} timeout={s} body_bytes={d} run_ms={d} response_bytes={d}", .{
         lang_slug,
         timeout_text,
         body_len,
@@ -288,6 +371,37 @@ fn handleRun(allocator: Allocator, req: *std.http.Server.Request, state: *Server
     });
 
     try sendJson(req, .ok, json_body);
+}
+
+fn readBodyLimited(
+    allocator: Allocator,
+    reader: *std.Io.Reader,
+    max_bytes: usize,
+) ![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(allocator);
+
+    var buf: [16 * 1024]u8 = undefined;
+    var too_large = false;
+    while (true) {
+        var bufs = [_][]u8{buf[0..]};
+        const n = reader.readVec(&bufs) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        if (n == 0) continue;
+        if (too_large) {
+            continue;
+        }
+        if (max_bytes > 0 and list.items.len + n > max_bytes) {
+            too_large = true;
+            continue;
+        }
+        try list.appendSlice(allocator, buf[0..n]);
+    }
+
+    if (too_large) return error.StreamTooLong;
+    return try list.toOwnedSlice(allocator);
 }
 
 fn parseTimeoutNs(timeout: ?[]const u8) !u64 {
@@ -373,7 +487,14 @@ fn getLangConfig(slug: []const u8) ?LangConfig {
     return null;
 }
 
-fn runInTemp(allocator: Allocator, lang: LangConfig, data: RunRequest, timeout_ns: u64, output_max: usize) !RunResult {
+fn runInTemp(
+    allocator: Allocator,
+    lang: LangConfig,
+    data: RunRequest,
+    timeout_ns: u64,
+    output_max: usize,
+    runner_argv: []const []const u8,
+) !RunResult {
     var temp = try makeTempDir(allocator);
     defer temp.deinit();
 
@@ -381,7 +502,7 @@ fn runInTemp(allocator: Allocator, lang: LangConfig, data: RunRequest, timeout_n
 
     try writeInputs(temp.dir, lang, data);
 
-    return try runMakeTest(allocator, temp.path, timeout_ns, output_max);
+    return try runCommand(allocator, temp.path, timeout_ns, output_max, runner_argv);
 }
 
 const RunResult = struct {
@@ -503,8 +624,14 @@ fn waiterThread(pid: std.posix.pid_t, state: *WaitState) void {
     state.mutex.unlock();
 }
 
-fn runMakeTest(allocator: Allocator, cwd_path: []const u8, timeout_ns: u64, output_max: usize) !RunResult {
-    var child = std.process.Child.init(&[_][]const u8{ "make", "test" }, allocator);
+fn runCommand(
+    allocator: Allocator,
+    cwd_path: []const u8,
+    timeout_ns: u64,
+    output_max: usize,
+    argv: []const []const u8,
+) !RunResult {
+    var child = std.process.Child.init(argv, allocator);
     child.cwd = cwd_path;
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Pipe;
@@ -516,6 +643,8 @@ fn runMakeTest(allocator: Allocator, cwd_path: []const u8, timeout_ns: u64, outp
 
     var stdout: std.ArrayList(u8) = .empty;
     var stderr: std.ArrayList(u8) = .empty;
+    defer stdout.deinit(allocator);
+    defer stderr.deinit(allocator);
 
     var out_truncated = false;
     var err_truncated = false;
@@ -569,11 +698,8 @@ fn runMakeTest(allocator: Allocator, cwd_path: []const u8, timeout_ns: u64, outp
     err_thread.join();
     waiter.join();
 
-    if (out_truncated) {
-        _ = stdout.appendSlice(allocator, "\n...[truncated]") catch {};
-    }
-    if (err_truncated) {
-        _ = stderr.appendSlice(allocator, "\n...[truncated]") catch {};
+    if (out_truncated or err_truncated) {
+        return error.OutputTooLarge;
     }
 
     return RunResult{

@@ -16,6 +16,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build binary
+        run: zig build
+
+      - name: Run unit tests
+        run: make test-unit
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 

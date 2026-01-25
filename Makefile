@@ -45,29 +45,24 @@ test-integration:
 ## Build and push multi-arch image (linux/amd64 + linux/arm64) for GHCR
 build-and-push: container-build container-push
 
-## Build multi-arch image (linux/amd64 + linux/arm64) for GHCR
+## Build a single-arch image for local use/tests
 container-build:
-	$(CONTAINER) buildx build --load \
-		--platform=linux/amd64 \
+	$(CONTAINER) build \
 		--file Containerfile \
-		--tag $(IMAGE):$(TAG)-amd64 \
+		--tag $(IMAGE):$(TAG) \
 		.
-	$(CONTAINER) buildx build --load \
-		--platform=linux/arm64 \
-		--file Containerfile \
-		--tag $(IMAGE):$(TAG)-arm64 \
-		.
-	-@$(CONTAINER) rmi $(IMAGE):$(TAG) >/dev/null 2>&1 || true
-	-@$(CONTAINER) manifest rm $(IMAGE):$(TAG) >/dev/null 2>&1 || true
-	$(CONTAINER) manifest create $(IMAGE):$(TAG) \
-		$(IMAGE):$(TAG)-amd64 \
-		$(IMAGE):$(TAG)-arm64
+
+## Pull the multi-arch manifest tag from registry
+container-pull:
+	$(CONTAINER) pull $(IMAGE):$(TAG)
 
 ## Push multi-arch image manifest + all platform layers to GHCR
 container-push:
-	$(CONTAINER) manifest push --all \
-		$(IMAGE):$(TAG) \
-		docker://$(IMAGE):$(TAG)
+	$(CONTAINER) buildx build --push \
+		--platform=linux/amd64,linux/arm64 \
+		--file Containerfile \
+		--tag $(IMAGE):$(TAG) \
+		.
 
 ## Quick local smoke check against the running server
 curl-local-health:

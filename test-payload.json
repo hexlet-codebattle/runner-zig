@@ -1,0 +1,7 @@
+{
+  "timeout": "5s",
+  "lang_slug": "zig",
+  "solution_text": "const std = @import(\"std\"); pub fn main() !void { var w = std.io.getStdOut().writer(); try w.print(\"{d}\\n\", .{2+3}); }",
+  "checker_text": "const std = @import(\"std\"); pub fn main() !void { var w = std.io.getStdOut().writer(); try w.print(\"ok\\n\", .{}); }",
+  "asserts": "{\"dummy\":true}"
+}

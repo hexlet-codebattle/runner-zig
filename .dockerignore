@@ -1,0 +1,14 @@
+.git
+.gitignore
+.DS_Store
+zig-cache
+zig-out
+.zig-cache
+.zig-out
+*.tmp
+*.log
+*.swp
+*.swo
+node_modules
+dist
+target

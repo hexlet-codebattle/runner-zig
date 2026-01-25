@@ -348,8 +348,8 @@ fn startServer(allocator: std.mem.Allocator, port: u16, options: ServerOptions) 
 
     var child = std.process.Child.init(&[_][]const u8{bin_path}, allocator);
     child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
     child.cwd = ".";
     child.env_map = &env;
     try child.spawn();

@@ -1,5 +1,9 @@
 const std = @import("std");
 
+pub const std_options: std.Options = .{
+    .log_level = .info,
+};
+
 const Allocator = std.mem.Allocator;
 
 const RunRequest = struct {
@@ -43,6 +47,7 @@ pub fn main() !void {
     const output_max = resolveOutputMax(allocator);
     const debug_enabled = resolveDebugEnabled(allocator);
     const runner_cmd = try resolveRunnerCmd(allocator);
+    defer runner_cmd.deinit(allocator);
     var state = ServerState.init(allow_shutdown, run_concurrency, input_max, output_max, debug_enabled, runner_cmd);
 
     try serve(allocator, port, &state);
@@ -191,6 +196,11 @@ fn resolveDebugEnabled(allocator: Allocator) bool {
 const RunnerCmd = struct {
     raw: []const u8,
     argv: []const []const u8,
+
+    fn deinit(self: RunnerCmd, allocator: Allocator) void {
+        allocator.free(self.raw);
+        allocator.free(self.argv);
+    }
 };
 
 fn resolveRunnerCmd(allocator: Allocator) !RunnerCmd {

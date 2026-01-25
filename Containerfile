@@ -48,6 +48,11 @@ RUN zig build -Doptimize=ReleaseSafe
 # Runtime stage
 FROM alpine:${ALPINE_VERSION}
 WORKDIR /app
+ARG PORT
+ARG RUN_CONCURRENCY
+ARG RUN_OUTPUT_MAX
+ARG DEBUG
+ARG ALLOW_SHUTDOWN
 RUN adduser -S -u 10001 app
 COPY --from=builder /build/zig-out/bin/runner-zig /app/codebattle_runner
 ENV PORT=$PORT \

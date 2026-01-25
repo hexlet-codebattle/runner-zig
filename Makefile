@@ -59,9 +59,9 @@ container-build:
 		.
 	-@$(CONTAINER) rmi $(IMAGE):$(TAG) >/dev/null 2>&1 || true
 	-@$(CONTAINER) manifest rm $(IMAGE):$(TAG) >/dev/null 2>&1 || true
-	$(CONTAINER) manifest create $(IMAGE):$(TAG)
-	$(CONTAINER) manifest add $(IMAGE):$(TAG) $(IMAGE):$(TAG)-amd64
-	$(CONTAINER) manifest add $(IMAGE):$(TAG) $(IMAGE):$(TAG)-arm64
+	$(CONTAINER) manifest create $(IMAGE):$(TAG) \
+		$(IMAGE):$(TAG)-amd64 \
+		$(IMAGE):$(TAG)-arm64
 
 ## Push multi-arch image manifest + all platform layers to GHCR
 container-push:

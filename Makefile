@@ -47,12 +47,12 @@ build-and-push: container-build container-push
 
 ## Build multi-arch image (linux/amd64 + linux/arm64) for GHCR
 container-build:
-	$(CONTAINER) build \
+	$(CONTAINER) buildx build --load \
 		--platform=linux/amd64 \
 		--file Containerfile \
 		--tag $(IMAGE):$(TAG)-amd64 \
 		.
-	$(CONTAINER) build \
+	$(CONTAINER) buildx build --load \
 		--platform=linux/arm64 \
 		--file Containerfile \
 		--tag $(IMAGE):$(TAG)-arm64 \

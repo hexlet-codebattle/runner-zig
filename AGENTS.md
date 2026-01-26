@@ -85,6 +85,14 @@ Environment variables:
 ## Isolation and Safety
 - The execution occurs in a temporary directory under `/tmp` built by copying the current workspace.
 - The service runs commands in a separate process group for reliable termination.
+- On Linux, each run is executed in new namespaces (PID, mount, IPC, UTS, NET) and drops to UID/GID 10001.
+- Network is disabled by placing the run in a new network namespace with no interfaces.
+- Resource limits (rlimits) are applied in the sandboxed child:
+  - `RLIMIT_CPU`: equals the request timeout (rounded up to whole seconds).
+  - `RLIMIT_NOFILE`: 256 open files.
+  - `RLIMIT_NPROC`: 256 processes/threads.
+  - `RLIMIT_CORE`: 0 (no core dumps).
+- Rationale for `256` limits: high enough for typical compilers/builds while preventing FD/process exhaustion; these can be tuned in code if needed.
 
 ## Runtime Notes
 - The service is stateless; each request creates a fresh temp workspace and cleans it up after execution.

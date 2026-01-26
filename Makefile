@@ -4,7 +4,7 @@ PLATFORMS ?= linux/amd64,linux/arm64
 CONTAINER ?= docker
 TEST_IMAGE ?= runner-zig-test
 
-.PHONY: build lint lint-fix test test-unit test-integration container-build container-push curl-local-health curl-local-test start
+.PHONY: build lint lint-fix test test-unit test-integration container-build container-push container-start curl-local-health curl-local-test start
 
 ## Build multi-arch image directly for GHCR
 build:
@@ -38,7 +38,7 @@ test-integration:
 		sleep 1; \
 	done; \
 	$(MAKE) --no-print-directory curl-local-health && \
-	seq 1 40 | xargs -n1 -P40 sh -c 'curl -sS -o /dev/null -w "%{http_code}\n" http://localhost:4040/run -H "content-type: application/json" -d @test-payload.json'; \
+	seq 1 60 | xargs -n1 -P60 sh -c 'curl -sS -o /dev/null -w "%{http_code}\n" http://localhost:4040/run -H "content-type: application/json" -d @test-payload.json'; \
 	if [ $$container_started -eq 1 ]; then $(CONTAINER) stop $$container_name >/dev/null 2>&1 || true; fi
 
 ## Build and push multi-arch image (linux/amd64 + linux/arm64) for GHCR
@@ -62,6 +62,14 @@ container-push:
 		--file Containerfile \
 		--tag $(IMAGE):$(TAG) \
 		.
+
+## Start the container locally on port 4040
+container-start:
+	$(CONTAINER) run --rm -p 4040:4040 \
+		--cap-add=SYS_ADMIN \
+		--cap-add=SYS_CHROOT \
+		--security-opt=no-new-privileges=false \
+		$(IMAGE):$(TAG)
 
 ## Quick local smoke check against the running server
 curl-local-health:

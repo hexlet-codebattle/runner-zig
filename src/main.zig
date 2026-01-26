@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -547,8 +548,11 @@ fn makeTempDir(allocator: Allocator) !TempDir {
         std.mem.copyForwards(u8, name_buf[7..], &suffix);
         const name = name_buf[0..];
 
-        const status = try tmp_parent.makePathStatus(name);
-        if (status == .existed) continue;
+        std.posix.mkdirat(tmp_parent.fd, name, 0o777) catch |err| switch (err) {
+            error.PathAlreadyExists => continue,
+            else => return err,
+        };
+        _ = std.posix.fchmodat(tmp_parent.fd, name, 0o777, 0) catch {};
 
         const dir = try tmp_parent.openDir(name, .{ .iterate = true });
         const path = try tmp_parent.realpathAlloc(allocator, name);
@@ -572,10 +576,14 @@ fn copyDirRecursive(src: std.fs.Dir, dst: std.fs.Dir, ignore: []const []const u8
 
         switch (entry.kind) {
             .directory => {
-                try dst.makePath(entry.name);
+                std.posix.mkdirat(dst.fd, entry.name, 0o777) catch |err| switch (err) {
+                    error.PathAlreadyExists => {},
+                    else => return err,
+                };
+                _ = std.posix.fchmodat(dst.fd, entry.name, 0o777, 0) catch {};
                 var src_child = try src.openDir(entry.name, .{ .iterate = true });
                 defer src_child.close();
-                var dst_child = try dst.openDir(entry.name, .{});
+                var dst_child = try dst.openDir(entry.name, .{ .iterate = true });
                 defer dst_child.close();
                 try copyDirRecursive(src_child, dst_child, ignore);
             },
@@ -635,6 +643,19 @@ fn waiterThread(pid: std.posix.pid_t, state: *WaitState) void {
 }
 
 fn runCommand(
+    allocator: Allocator,
+    cwd_path: []const u8,
+    timeout_ns: u64,
+    output_max: usize,
+    argv: []const []const u8,
+) !RunResult {
+    if (builtin.os.tag == .linux) {
+        return runCommandSandboxed(allocator, cwd_path, timeout_ns, output_max, argv);
+    }
+    return runCommandSimple(allocator, cwd_path, timeout_ns, output_max, argv);
+}
+
+fn runCommandSimple(
     allocator: Allocator,
     cwd_path: []const u8,
     timeout_ns: u64,
@@ -717,6 +738,160 @@ fn runCommand(
         .stdout = try stdout.toOwnedSlice(allocator),
         .stderr = try stderr.toOwnedSlice(allocator),
     };
+}
+
+fn runCommandSandboxed(
+    allocator: Allocator,
+    cwd_path: []const u8,
+    timeout_ns: u64,
+    output_max: usize,
+    argv: []const []const u8,
+) !RunResult {
+    const linux = std.os.linux;
+    var argv_storage = try allocator.alloc([:0]u8, argv.len);
+    defer {
+        for (argv_storage) |item| allocator.free(item);
+        allocator.free(argv_storage);
+    }
+    var argv_z = try allocator.allocSentinel(?[*:0]const u8, argv.len, null);
+    defer allocator.free(argv_z);
+    for (argv, 0..) |arg, i| {
+        argv_storage[i] = try allocator.dupeZ(u8, arg);
+        argv_z[i] = argv_storage[i].ptr;
+    }
+    argv_z[argv.len] = null;
+
+    const env_in = std.os.environ;
+    var envp = try allocator.allocSentinel(?[*:0]const u8, env_in.len, null);
+    defer allocator.free(envp);
+    for (env_in, 0..) |item, i| envp[i] = item;
+    envp[env_in.len] = null;
+
+    const stdout_pipe = try std.posix.pipe();
+    const stderr_pipe = try std.posix.pipe();
+
+    const pid = try std.posix.fork();
+    if (pid == 0) {
+        std.posix.close(stdout_pipe[0]);
+        std.posix.close(stderr_pipe[0]);
+        _ = std.posix.setpgid(0, 0) catch {};
+
+        try unshareNamespaces();
+
+        const child_pid = try std.posix.fork();
+        if (child_pid == 0) {
+            _ = std.posix.dup2(stdout_pipe[1], std.posix.STDOUT_FILENO) catch {};
+            _ = std.posix.dup2(stderr_pipe[1], std.posix.STDERR_FILENO) catch {};
+            const devnull = std.posix.open("/dev/null", .{ .ACCMODE = .RDONLY }, 0) catch -1;
+            if (devnull >= 0) {
+                _ = std.posix.dup2(devnull, std.posix.STDIN_FILENO) catch {};
+                std.posix.close(devnull);
+            }
+            std.posix.close(stdout_pipe[1]);
+            std.posix.close(stderr_pipe[1]);
+
+            std.posix.chdir(cwd_path) catch {};
+            _ = std.posix.setgid(10001) catch {};
+            _ = std.posix.setuid(10001) catch {};
+            _ = linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0);
+            applyRlimits(timeout_ns) catch {};
+
+            const argv_ptr = @as([*:null]const ?[*:0]const u8, @ptrCast(argv_z.ptr));
+            const envp_ptr = @as([*:null]const ?[*:0]const u8, @ptrCast(envp.ptr));
+            _ = std.posix.execvpeZ(argv_z[0].?, argv_ptr, envp_ptr) catch {};
+            std.posix.exit(127);
+        }
+
+        const wait_result = std.posix.waitpid(child_pid, 0);
+        const exit_code = decodeExitCode(wait_result.status) orelse 255;
+        std.posix.exit(@as(u8, @intCast(@min(exit_code, 255))));
+    }
+
+    std.posix.close(stdout_pipe[1]);
+    std.posix.close(stderr_pipe[1]);
+
+    var stdout: std.ArrayList(u8) = .empty;
+    var stderr: std.ArrayList(u8) = .empty;
+    defer stdout.deinit(allocator);
+    defer stderr.deinit(allocator);
+
+    var out_truncated = false;
+    var err_truncated = false;
+    var out_ctx = ReadPipeCtx{
+        .file = std.fs.File{ .handle = stdout_pipe[0] },
+        .list = &stdout,
+        .allocator = allocator,
+        .max_bytes = output_max,
+        .truncated = &out_truncated,
+    };
+    var err_ctx = ReadPipeCtx{
+        .file = std.fs.File{ .handle = stderr_pipe[0] },
+        .list = &stderr,
+        .allocator = allocator,
+        .max_bytes = output_max,
+        .truncated = &err_truncated,
+    };
+
+    var out_thread = try std.Thread.spawn(.{}, readPipe, .{&out_ctx});
+    var err_thread = try std.Thread.spawn(.{}, readPipe, .{&err_ctx});
+
+    var wait_state = WaitState{};
+    var waiter = try std.Thread.spawn(.{}, waiterThread, .{ pid, &wait_state });
+
+    var exit_code: ?i32 = null;
+    var timed_out = false;
+
+    wait_state.mutex.lock();
+    if (!wait_state.done) {
+        wait_state.cond.timedWait(&wait_state.mutex, timeout_ns) catch |err| switch (err) {
+            error.Timeout => timed_out = true,
+        };
+    }
+    if (!timed_out and wait_state.done) {
+        exit_code = decodeExitCode(wait_state.status);
+    }
+    wait_state.mutex.unlock();
+
+    if (timed_out) {
+        std.log.warn("run timed out; killing process group", .{});
+        _ = std.posix.kill(-pid, std.posix.SIG.KILL) catch {};
+        wait_state.mutex.lock();
+        while (!wait_state.done) {
+            wait_state.cond.wait(&wait_state.mutex);
+        }
+        wait_state.mutex.unlock();
+        exit_code = null;
+    }
+
+    out_thread.join();
+    err_thread.join();
+    waiter.join();
+
+    if (out_truncated or err_truncated) {
+        return error.OutputTooLarge;
+    }
+
+    return RunResult{
+        .exit_code = exit_code,
+        .stdout = try stdout.toOwnedSlice(allocator),
+        .stderr = try stderr.toOwnedSlice(allocator),
+    };
+}
+
+fn unshareNamespaces() !void {
+    const linux = std.os.linux;
+    const flags = linux.CLONE.NEWNS | linux.CLONE.NEWPID | linux.CLONE.NEWIPC | linux.CLONE.NEWUTS | linux.CLONE.NEWNET;
+    if (linux.unshare(flags) != 0) return error.UnshareFailed;
+    const root: [:0]const u8 = "/";
+    if (linux.mount(null, root.ptr, null, linux.MS.REC | linux.MS.PRIVATE, 0) != 0) return error.MountPrivateFailed;
+}
+
+fn applyRlimits(timeout_ns: u64) !void {
+    const cpu_seconds: u64 = @max(1, @divTrunc(timeout_ns + std.time.ns_per_s - 1, std.time.ns_per_s));
+    _ = std.posix.setrlimit(.CPU, .{ .cur = cpu_seconds, .max = cpu_seconds }) catch {};
+    _ = std.posix.setrlimit(.NOFILE, .{ .cur = 256, .max = 256 }) catch {};
+    _ = std.posix.setrlimit(.NPROC, .{ .cur = 256, .max = 256 }) catch {};
+    _ = std.posix.setrlimit(.CORE, .{ .cur = 0, .max = 0 }) catch {};
 }
 
 fn decodeExitCode(status: u32) ?i32 {

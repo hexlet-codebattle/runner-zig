@@ -55,15 +55,14 @@ ARG RUN_INPUT_MAX
 ARG RUN_OUTPUT_MAX
 ARG DEBUG
 ARG ALLOW_SHUTDOWN
-RUN adduser -S -u 10001 app
-COPY --from=builder /build/zig-out/bin/runner-zig /app/codebattle_runner
+RUN apk add --no-cache make
+COPY --from=builder /build /app
+RUN cp /app/zig-out/bin/runner-zig /app/codebattle_runner
 ENV PORT=$PORT \
     RUN_CONCURRENCY=$RUN_CONCURRENCY \
     RUN_INPUT_MAX=$RUN_INPUT_MAX \
     RUN_OUTPUT_MAX=$RUN_OUTPUT_MAX \
     DEBUG=$DEBUG \
     ALLOW_SHUTDOWN=$ALLOW_SHUTDOWN
-USER app
-
 EXPOSE 4040
 ENTRYPOINT ["/app/codebattle_runner"]

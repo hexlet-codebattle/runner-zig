@@ -1,30 +1,28 @@
 const std = @import("std");
+const Io = std.Io;
+const Environ = std.process.Environ;
+
 const RunResponse = struct {
     exit_code: ?i32,
     stdout: []const u8,
     stderr: []const u8,
 };
 
-var test_mutex = std.Thread.Mutex{};
-
 test "run executes zig solution via http" {
-    test_mutex.lock();
-    defer test_mutex.unlock();
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
     logTest("basic zig run over HTTP");
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
 
-    const port = try pickFreePort();
-    var proc = try startServer(allocator, port, .{});
-    defer stopServer(allocator, port, &proc);
+    const port = try pickFreePort(io);
+    var proc = try startServer(allocator, io, port, .{});
+    defer stopServer(allocator, io, port, &proc);
 
-    try waitForHealth(allocator, port);
+    try waitForHealth(allocator, io, port);
 
     const body = try buildZigPayload(allocator);
     defer allocator.free(body);
 
-    const response = try httpRequest(allocator, port, "POST", "/run", body);
+    const response = try httpRequest(allocator, io, port, "POST", "/run", body);
     defer allocator.free(response.body);
 
     try std.testing.expectEqual(@as(u16, 200), response.status);
@@ -36,23 +34,20 @@ test "run executes zig solution via http" {
     try std.testing.expectEqual(@as(i32, 0), parsed.value.exit_code.?);
     try std.testing.expect(parsed.value.stderr.len == 0);
 
-    const shutdown_response = try httpRequest(allocator, port, "POST", "/shutdown", "{}");
+    const shutdown_response = try httpRequest(allocator, io, port, "POST", "/shutdown", "{}");
     defer allocator.free(shutdown_response.body);
 }
 
 test "run rejects payloads larger than limit" {
-    test_mutex.lock();
-    defer test_mutex.unlock();
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
     logTest("payload size limit enforced");
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
 
-    const port = try pickFreePort();
-    var proc = try startServer(allocator, port, .{ .input_max = 1024 });
-    defer stopServer(allocator, port, &proc);
+    const port = try pickFreePort(io);
+    var proc = try startServer(allocator, io, port, .{ .input_max = 1024 });
+    defer stopServer(allocator, io, port, &proc);
 
-    try waitForHealth(allocator, port);
+    try waitForHealth(allocator, io, port);
 
     const big_solution = try allocator.alloc(u8, 1200);
     defer allocator.free(big_solution);
@@ -67,25 +62,22 @@ test "run rejects payloads larger than limit" {
     const body = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(body);
 
-    const response = try httpRequest(allocator, port, "POST", "/run", body);
+    const response = try httpRequest(allocator, io, port, "POST", "/run", body);
     defer allocator.free(response.body);
 
     try std.testing.expectEqual(@as(u16, 413), response.status);
 }
 
 test "run rejects output larger than limit" {
-    test_mutex.lock();
-    defer test_mutex.unlock();
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
     logTest("output size limit enforced");
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
 
-    const port = try pickFreePort();
-    var proc = try startServer(allocator, port, .{ .output_max = 1 });
-    defer stopServer(allocator, port, &proc);
+    const port = try pickFreePort(io);
+    var proc = try startServer(allocator, io, port, .{ .output_max = 1 });
+    defer stopServer(allocator, io, port, &proc);
 
-    try waitForHealth(allocator, port);
+    try waitForHealth(allocator, io, port);
 
     const solution_text =
         \\print("a" * 2000)
@@ -100,25 +92,22 @@ test "run rejects output larger than limit" {
     const body = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(body);
 
-    const response = try httpRequest(allocator, port, "POST", "/run", body);
+    const response = try httpRequest(allocator, io, port, "POST", "/run", body);
     defer allocator.free(response.body);
 
     try std.testing.expectEqual(@as(u16, 413), response.status);
 }
 
 test "run rejects unsupported language" {
-    test_mutex.lock();
-    defer test_mutex.unlock();
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
     logTest("unsupported language rejected");
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
 
-    const port = try pickFreePort();
-    var proc = try startServer(allocator, port, .{});
-    defer stopServer(allocator, port, &proc);
+    const port = try pickFreePort(io);
+    var proc = try startServer(allocator, io, port, .{});
+    defer stopServer(allocator, io, port, &proc);
 
-    try waitForHealth(allocator, port);
+    try waitForHealth(allocator, io, port);
 
     const payload = .{
         .timeout = "5s",
@@ -129,28 +118,24 @@ test "run rejects unsupported language" {
     const body = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(body);
 
-    const response = try httpRequest(allocator, port, "POST", "/run", body);
+    const response = try httpRequest(allocator, io, port, "POST", "/run", body);
     defer allocator.free(response.body);
 
     try std.testing.expectEqual(@as(u16, 400), response.status);
 }
 
 test "run handles concurrent load" {
-    test_mutex.lock();
-    defer test_mutex.unlock();
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
     logTest("concurrent load test");
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
 
-    const port = try pickFreePort();
+    const port = try pickFreePort(io);
     const thread_count = resolveEnvUsize(allocator, "RUNNER_TEST_THREADS", 8);
     const requests_per_thread = resolveEnvUsize(allocator, "RUNNER_TEST_REQUESTS", 6);
-    std.debug.print("[TEST] load params: threads={d} requests_per_thread={d}\n", .{ thread_count, requests_per_thread });
-    var proc = try startServer(allocator, port, .{ .run_concurrency = thread_count });
-    defer stopServer(allocator, port, &proc);
+    var proc = try startServer(allocator, io, port, .{ .run_concurrency = thread_count });
+    defer stopServer(allocator, io, port, &proc);
 
-    try waitForHealth(allocator, port);
+    try waitForHealth(allocator, io, port);
 
     const body = try buildZigPayload(allocator);
     defer allocator.free(body);
@@ -161,6 +146,7 @@ test "run handles concurrent load" {
     defer allocator.free(threads);
     for (threads, 0..) |*t, i| {
         t.* = try std.Thread.spawn(.{}, runLoadWorker, .{
+            io,
             port,
             body,
             requests_per_thread,
@@ -173,13 +159,90 @@ test "run handles concurrent load" {
     try std.testing.expectEqual(@as(usize, 0), failures.load(.seq_cst));
 }
 
+test "server rss does not grow under sustained load" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    logTest("rss growth check");
+
+    const port = try pickFreePort(io);
+    var proc = try startServer(allocator, io, port, .{ .run_concurrency = 8 });
+    defer stopServer(allocator, io, port, &proc);
+
+    try waitForHealth(allocator, io, port);
+
+    const body = try buildZigPayload(allocator);
+    defer allocator.free(body);
+
+    const pid = proc.child.id orelse return error.NoPid;
+
+    // Warmup: drive enough requests that the allocator high-water mark, the
+    // per-connection arenas, and any one-shot startup buffers reach steady
+    // state. Without this, the initial growth from cold caches would look
+    // like a leak.
+    const warmup_count: usize = resolveEnvUsize(allocator, "RUNNER_RSS_WARMUP", 30);
+    var i: usize = 0;
+    while (i < warmup_count) : (i += 1) {
+        const r = try httpRequest(allocator, io, port, "POST", "/run", body);
+        allocator.free(r.body);
+        try std.testing.expectEqual(@as(u16, 200), r.status);
+    }
+    // Give detached cleanup threads a chance to drain before sampling baseline.
+    io.sleep(.fromNanoseconds(200 * std.time.ns_per_ms), .awake) catch {};
+
+    const rss_before_kb = try readRssKb(allocator, io, pid);
+
+    // Bulk phase.
+    const bulk_count: usize = resolveEnvUsize(allocator, "RUNNER_RSS_BULK", 300);
+    i = 0;
+    while (i < bulk_count) : (i += 1) {
+        const r = try httpRequest(allocator, io, port, "POST", "/run", body);
+        allocator.free(r.body);
+        try std.testing.expectEqual(@as(u16, 200), r.status);
+    }
+    io.sleep(.fromNanoseconds(500 * std.time.ns_per_ms), .awake) catch {};
+
+    const rss_after_kb = try readRssKb(allocator, io, pid);
+
+    // Tolerance: a real leak shows up as RSS growth that scales with request
+    // count. A few MB of allocator hold-back is normal; >32 KB per request
+    // sustained is suspicious.
+    const max_growth_kb_per_req: usize = resolveEnvUsize(allocator, "RUNNER_RSS_MAX_KB_PER_REQ", 32);
+    const min_floor_kb: usize = resolveEnvUsize(allocator, "RUNNER_RSS_MIN_FLOOR_KB", 2 * 1024);
+    const budget_kb = @max(min_floor_kb, bulk_count * max_growth_kb_per_req);
+
+    if (rss_after_kb > rss_before_kb + budget_kb) {
+        std.debug.print(
+            "[LEAK] rss before={d} KB after={d} KB delta={d} KB budget={d} KB ({d} requests)\n",
+            .{ rss_before_kb, rss_after_kb, rss_after_kb - rss_before_kb, budget_kb, bulk_count },
+        );
+        return error.MemoryLeaked;
+    }
+}
+
+/// Returns the runner process's resident set size in KB. Uses `ps`, which
+/// works the same on macOS and Linux.
+fn readRssKb(allocator: std.mem.Allocator, io: Io, pid: std.posix.pid_t) !usize {
+    const pid_str = try std.fmt.allocPrint(allocator, "{d}", .{pid});
+    defer allocator.free(pid_str);
+
+    const result = try std.process.run(allocator, io, .{
+        .argv = &.{ "ps", "-o", "rss=", "-p", pid_str },
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
+    if (trimmed.len == 0) return error.RssNotAvailable;
+    return std.fmt.parseUnsigned(usize, trimmed, 10);
+}
+
 const HttpResponse = struct {
     status: u16,
     body: []u8,
 };
 
-fn httpRequest(allocator: std.mem.Allocator, port: u16, method: []const u8, path: []const u8, body: []const u8) !HttpResponse {
-    var client = std.http.Client{ .allocator = allocator };
+fn httpRequest(allocator: std.mem.Allocator, io: Io, port: u16, method: []const u8, path: []const u8, body: []const u8) !HttpResponse {
+    var client: std.http.Client = .{ .allocator = allocator, .io = io };
     defer client.deinit();
 
     const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}{s}", .{ port, path });
@@ -196,44 +259,49 @@ fn httpRequest(allocator: std.mem.Allocator, port: u16, method: []const u8, path
     if (method_enum == .POST) {
         const body_buf = try allocator.alloc(u8, body.len);
         defer allocator.free(body_buf);
-        std.mem.copyForwards(u8, body_buf, body);
+        @memcpy(body_buf, body);
         try req.sendBodyComplete(body_buf);
     } else {
         try req.sendBodiless();
     }
-    var response = try req.receiveHead(&.{});
+    var redirect_buf: [1024]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buf);
     var transfer_buf: [8 * 1024]u8 = undefined;
     const reader = response.reader(&transfer_buf);
     const res_body = try reader.allocRemaining(allocator, .limited(2 << 20));
     return .{ .status = @intFromEnum(response.head.status), .body = res_body };
 }
 
-fn waitForHealth(allocator: std.mem.Allocator, port: u16) !void {
+fn waitForHealth(allocator: std.mem.Allocator, io: Io, port: u16) !void {
     var attempts: usize = 0;
     while (attempts < 40) : (attempts += 1) {
-        const result = httpRequest(allocator, port, "GET", "/health", "") catch {
-            std.Thread.sleep(50 * std.time.ns_per_ms);
+        const result = httpRequest(allocator, io, port, "GET", "/health", "") catch {
+            io.sleep(.fromNanoseconds(50 * std.time.ns_per_ms), .awake) catch {};
             continue;
         };
         defer allocator.free(result.body);
         if (result.status == 200) return;
-        std.Thread.sleep(50 * std.time.ns_per_ms);
+        io.sleep(.fromNanoseconds(50 * std.time.ns_per_ms), .awake) catch {};
     }
     return error.ServerNotReady;
 }
 
-fn pickFreePort() !u16 {
-    const address = std.net.Address.initIp4([4]u8{ 0, 0, 0, 0 }, 0);
-    var server_stream = try std.net.Address.listen(address, .{ .reuse_address = true });
-    defer server_stream.deinit();
-    return server_stream.listen_address.getPort();
+fn pickFreePort(io: Io) !u16 {
+    var address: Io.net.IpAddress = .{ .ip4 = .unspecified(0) };
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+    return server.socket.address.getPort();
 }
 
 fn logTest(message: []const u8) void {
-    std.debug.print("\n[TEST] {s}\n", .{message});
+    // Intentionally silent: writing to stderr here makes Zig 0.16's build
+    // runner print "failed command:" after passing tests. The zig-test runner
+    // already announces each test by name.
+    _ = message;
 }
 
 fn runLoadWorker(
+    io: Io,
     port: u16,
     body: []const u8,
     requests_per_thread: usize,
@@ -241,13 +309,13 @@ fn runLoadWorker(
     worker_id: usize,
 ) void {
     _ = worker_id;
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    var dbg: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = dbg.deinit();
+    const allocator = dbg.allocator();
 
     var i: usize = 0;
     while (i < requests_per_thread) : (i += 1) {
-        const response = httpRequest(allocator, port, "POST", "/run", body) catch {
+        const response = httpRequest(allocator, io, port, "POST", "/run", body) catch {
             _ = failures.fetchAdd(1, .seq_cst);
             continue;
         };
@@ -270,18 +338,17 @@ fn buildZigPayload(allocator: std.mem.Allocator) ![]u8 {
         \\const std = @import("std");
         \\const solution = @import("solution.zig");
         \\
-        \\pub fn main() !void {
-        \\    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-        \\    defer _ = gpa.deinit();
-        \\    const allocator = gpa.allocator();
+        \\pub fn main(init: std.process.Init) !void {
+        \\    const gpa = init.gpa;
+        \\    const io = init.io;
         \\
-        \\    var file = try std.fs.cwd().openFile("asserts.json", .{});
-        \\    defer file.close();
-        \\    const data = try file.readToEndAlloc(allocator, 1 << 20);
-        \\    defer allocator.free(data);
+        \\    var file = try std.Io.Dir.cwd().openFile(io, "asserts.json", .{});
+        \\    defer file.close(io);
+        \\    const data = try file.readToEndAlloc(io, gpa, 1 << 20);
+        \\    defer gpa.free(data);
         \\
         \\    const Case = struct { a: i64, b: i64, expected: i64 };
-        \\    var parsed = try std.json.parseFromSlice([]Case, allocator, data, .{});
+        \\    var parsed = try std.json.parseFromSlice([]Case, gpa, data, .{});
         \\    defer parsed.deinit();
         \\
         \\    for (parsed.value) |item| {
@@ -308,17 +375,14 @@ fn buildZigPayload(allocator: std.mem.Allocator) ![]u8 {
 }
 
 fn resolveEnvUsize(allocator: std.mem.Allocator, name: []const u8, fallback: usize) usize {
-    if (std.process.getEnvVarOwned(allocator, name)) |value| {
-        defer allocator.free(value);
-        return std.fmt.parseUnsigned(usize, value, 10) catch fallback;
-    } else |_| {
-        return fallback;
-    }
+    _ = allocator;
+    const value = std.testing.environ.getPosix(name) orelse return fallback;
+    return std.fmt.parseUnsigned(usize, value, 10) catch fallback;
 }
 
 const ServerProcess = struct {
     child: std.process.Child,
-    env: std.process.EnvMap,
+    env: Environ.Map,
 };
 
 const ServerOptions = struct {
@@ -327,11 +391,13 @@ const ServerOptions = struct {
     run_concurrency: usize = 10,
 };
 
-fn startServer(allocator: std.mem.Allocator, port: u16, options: ServerOptions) !ServerProcess {
+fn startServer(allocator: std.mem.Allocator, io: Io, port: u16, options: ServerOptions) !ServerProcess {
     const bin_path = "zig-out/bin/runner-zig";
-    std.fs.cwd().access(bin_path, .{}) catch return error.RunnerBinaryMissing;
+    Io.Dir.cwd().access(io, bin_path, .{}) catch return error.RunnerBinaryMissing;
 
-    var env = std.process.EnvMap.init(allocator);
+    var env: Environ.Map = .init(allocator);
+    errdefer env.deinit();
+
     const port_text = try std.fmt.allocPrint(allocator, "{d}", .{port});
     defer allocator.free(port_text);
     try env.put("PORT", port_text);
@@ -346,50 +412,53 @@ fn startServer(allocator: std.mem.Allocator, port: u16, options: ServerOptions) 
     try env.put("RUN_OUTPUT_MAX", output_max_text);
     try env.put("RUN_CONCURRENCY", concurrency_text);
 
-    var child = std.process.Child.init(&[_][]const u8{bin_path}, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
-    child.cwd = ".";
-    child.env_map = &env;
-    try child.spawn();
+    // Discard server stdio: inheriting it makes Zig 0.16's build runner think
+    // the test step produced stderr (and then print a misleading "failed command:"
+    // line even when all tests pass).
+    const child = try std.process.spawn(io, .{
+        .argv = &.{bin_path},
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .cwd = .{ .path = "." },
+        .environ_map = &env,
+    });
     return .{ .child = child, .env = env };
 }
 
-fn stopServer(allocator: std.mem.Allocator, port: u16, proc: *ServerProcess) void {
+fn stopServer(allocator: std.mem.Allocator, io: Io, port: u16, proc: *ServerProcess) void {
     var shutdown_sent = false;
-    if (httpRequest(allocator, port, "POST", "/shutdown", "{}")) |resp| {
+    if (httpRequest(allocator, io, port, "POST", "/shutdown", "{}")) |resp| {
         allocator.free(resp.body);
         shutdown_sent = true;
     } else |_| {}
     if (shutdown_sent) {
-        if (httpRequest(allocator, port, "GET", "/health", "")) |resp| {
+        if (httpRequest(allocator, io, port, "GET", "/health", "")) |resp| {
             allocator.free(resp.body);
         } else |_| {}
-        if (!waitForExit(proc.child.id, 2 * std.time.ns_per_s)) {
-            _ = std.posix.kill(proc.child.id, std.posix.SIG.KILL) catch {};
+        if (proc.child.id) |pid| {
+            if (!waitForExit(io, pid, 2 * std.time.ns_per_s)) {
+                _ = std.posix.kill(pid, .KILL) catch {};
+            }
         }
-    } else {
-        _ = std.posix.kill(proc.child.id, std.posix.SIG.KILL) catch {};
+    } else if (proc.child.id) |pid| {
+        _ = std.posix.kill(pid, .KILL) catch {};
     }
-    _ = proc.child.wait() catch {};
-    if (proc.child.stdout) |file| file.close();
-    if (proc.child.stderr) |file| file.close();
+    _ = proc.child.wait(io) catch {};
     proc.env.deinit();
 }
 
-fn waitForExit(pid: std.posix.pid_t, timeout_ns: u64) bool {
-    const deadline = std.time.nanoTimestamp() + @as(i128, @intCast(timeout_ns));
-    while (std.time.nanoTimestamp() < deadline) {
-        const alive = std.posix.kill(pid, 0);
-        if (alive) |_| {
-            // still running
-        } else |err| switch (err) {
+fn waitForExit(io: Io, pid: std.posix.pid_t, timeout_ns: u64) bool {
+    const start = Io.Timestamp.now(io, .awake);
+    const limit_ns: i128 = @intCast(timeout_ns);
+    while (true) {
+        const elapsed: i128 = @as(i128, @intCast(Io.Timestamp.now(io, .awake).nanoseconds)) - @as(i128, @intCast(start.nanoseconds));
+        if (elapsed >= limit_ns) return false;
+        std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
             error.ProcessNotFound => return true,
             error.PermissionDenied => return true,
             else => {},
-        }
-        std.Thread.sleep(20 * std.time.ns_per_ms);
+        };
+        io.sleep(.fromNanoseconds(20 * std.time.ns_per_ms), .awake) catch {};
     }
-    return false;
 }

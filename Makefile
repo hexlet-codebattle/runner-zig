@@ -18,10 +18,17 @@ lint:
 lint-fix:
 	zig fmt src
 
-## Recipe used by the runner: execute the python solution against asserts.json.
-## `make -n test` (run at startup) resolves this to the shell command every /run dispatches.
+## Recipe used by the runner: dispatch by which solution/checker file is present
+## in check/. `make -n test` is captured at startup and replayed for every /run.
+## Checker-required langs (zig, ...) put their entry point in checker.*; simple
+## langs (python, js, ruby, ...) just have solution.*.
 test:
-	cd check && python3 solution.py
+	cd check && \
+	if   [ -f checker.zig ];    then zig run checker.zig; \
+	elif [ -f solution.py ];    then python3 solution.py; \
+	elif [ -f solution.js ];    then node solution.js; \
+	elif [ -f solution.rb ];    then ruby solution.rb; \
+	else echo "no recognized solution file" >&2; exit 1; fi
 
 ## Run integration tests inside the builder container
 test-unit:

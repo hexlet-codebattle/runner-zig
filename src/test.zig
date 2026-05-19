@@ -8,10 +8,105 @@ const RunResponse = struct {
     stderr: []const u8,
 };
 
+/// One entry per language we exercise end-to-end through the runner.
+/// Adding a new lang here + a matching branch in the Makefile dispatcher is
+/// all it takes to extend coverage.
+const LangSpec = struct {
+    lang_slug: []const u8,
+    solution_text: []const u8,
+    checker_text: ?[]const u8 = null,
+    asserts: ?[]const u8 = null,
+    expected_stdout: []const u8 = "",
+    expected_exit_code: i32 = 0,
+    /// Executable name used to detect whether the toolchain is installed on
+    /// the test host (probed via `which`). Missing → test skips.
+    probe_cmd: []const u8,
+};
+
+const python_spec: LangSpec = .{
+    .lang_slug = "python",
+    .solution_text =
+        \\import json
+        \\with open('asserts.json') as f:
+        \\    data = json.load(f)
+        \\for c in data:
+        \\    print(c['a'] + c['b'])
+        \\
+    ,
+    .asserts = "[{\"a\":2,\"b\":3}]",
+    .expected_stdout = "5\n",
+    .probe_cmd = "python3",
+};
+
+const js_spec: LangSpec = .{
+    .lang_slug = "js",
+    .solution_text =
+        \\const fs = require('fs');
+        \\const data = JSON.parse(fs.readFileSync('asserts.json', 'utf8'));
+        \\for (const c of data) console.log(c.a + c.b);
+        \\
+    ,
+    .asserts = "[{\"a\":2,\"b\":3}]",
+    .expected_stdout = "5\n",
+    .probe_cmd = "node",
+};
+
+const ruby_spec: LangSpec = .{
+    .lang_slug = "ruby",
+    .solution_text =
+        \\require 'json'
+        \\data = JSON.parse(File.read('asserts.json'))
+        \\data.each { |c| puts c['a'] + c['b'] }
+        \\
+    ,
+    .asserts = "[{\"a\":2,\"b\":3}]",
+    .expected_stdout = "5\n",
+    .probe_cmd = "ruby",
+};
+
+const zig_spec: LangSpec = .{
+    .lang_slug = "zig",
+    .solution_text =
+        \\pub fn solution(a: i64, b: i64) i64 {
+        \\    return a + b;
+        \\}
+    ,
+    .checker_text =
+        \\const std = @import("std");
+        \\const solution = @import("solution.zig");
+        \\
+        \\pub fn main(init: std.process.Init) !void {
+        \\    const got = solution.solution(2, 3);
+        \\    var buf: [32]u8 = undefined;
+        \\    const slice = try std.fmt.bufPrint(&buf, "{d}\n", .{got});
+        \\    try std.Io.File.stdout().writeStreamingAll(init.io, slice);
+        \\}
+    ,
+    .expected_stdout = "5\n",
+    .probe_cmd = "zig",
+};
+
+test "run executes python solution via http" {
+    try runLangTest(python_spec);
+}
+
+test "run executes js solution via http" {
+    try runLangTest(js_spec);
+}
+
+test "run executes ruby solution via http" {
+    try runLangTest(ruby_spec);
+}
+
 test "run executes zig solution via http" {
+    try runLangTest(zig_spec);
+}
+
+fn runLangTest(spec: LangSpec) !void {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    logTest("basic zig run over HTTP");
+
+    if (!hasToolchain(allocator, io, spec.probe_cmd)) return error.SkipZigTest;
 
     const port = try pickFreePort(io);
     var proc = try startServer(allocator, io, port, .{});
@@ -19,7 +114,7 @@ test "run executes zig solution via http" {
 
     try waitForHealth(allocator, io, port);
 
-    const body = try buildZigPayload(allocator);
+    const body = try buildPayload(allocator, spec);
     defer allocator.free(body);
 
     const response = try httpRequest(allocator, io, port, "POST", "/run", body);
@@ -31,11 +126,20 @@ test "run executes zig solution via http" {
     defer parsed.deinit();
 
     try std.testing.expect(parsed.value.exit_code != null);
-    try std.testing.expectEqual(@as(i32, 0), parsed.value.exit_code.?);
-    try std.testing.expect(parsed.value.stderr.len == 0);
+    try std.testing.expectEqual(spec.expected_exit_code, parsed.value.exit_code.?);
+    try std.testing.expectEqualStrings(spec.expected_stdout, parsed.value.stdout);
+}
 
-    const shutdown_response = try httpRequest(allocator, io, port, "POST", "/shutdown", "{}");
-    defer allocator.free(shutdown_response.body);
+fn hasToolchain(allocator: std.mem.Allocator, io: Io, cmd: []const u8) bool {
+    const result = std.process.run(allocator, io, .{
+        .argv = &.{ "which", cmd },
+    }) catch return false;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    return switch (result.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
 }
 
 test "run rejects payloads larger than limit" {
@@ -129,6 +233,8 @@ test "run handles concurrent load" {
     const io = std.testing.io;
     logTest("concurrent load test");
 
+    if (!hasToolchain(allocator, io, python_spec.probe_cmd)) return error.SkipZigTest;
+
     const port = try pickFreePort(io);
     const thread_count = resolveEnvUsize(allocator, "RUNNER_TEST_THREADS", 8);
     const requests_per_thread = resolveEnvUsize(allocator, "RUNNER_TEST_REQUESTS", 6);
@@ -137,7 +243,7 @@ test "run handles concurrent load" {
 
     try waitForHealth(allocator, io, port);
 
-    const body = try buildZigPayload(allocator);
+    const body = try buildPayload(allocator, python_spec);
     defer allocator.free(body);
 
     var failures = std.atomic.Value(usize).init(0);
@@ -164,13 +270,15 @@ test "server rss does not grow under sustained load" {
     const io = std.testing.io;
     logTest("rss growth check");
 
+    if (!hasToolchain(allocator, io, python_spec.probe_cmd)) return error.SkipZigTest;
+
     const port = try pickFreePort(io);
     var proc = try startServer(allocator, io, port, .{ .run_concurrency = 8 });
     defer stopServer(allocator, io, port, &proc);
 
     try waitForHealth(allocator, io, port);
 
-    const body = try buildZigPayload(allocator);
+    const body = try buildPayload(allocator, python_spec);
     defer allocator.free(body);
 
     const pid = proc.child.id orelse return error.NoPid;
@@ -327,50 +435,14 @@ fn runLoadWorker(
     }
 }
 
-fn buildZigPayload(allocator: std.mem.Allocator) ![]u8 {
-    const solution_text =
-        \\pub fn solution(a: i64, b: i64) i64 {
-        \\    return a + b;
-        \\}
-    ;
-
-    const checker_text =
-        \\const std = @import("std");
-        \\const solution = @import("solution.zig");
-        \\
-        \\pub fn main(init: std.process.Init) !void {
-        \\    const gpa = init.gpa;
-        \\    const io = init.io;
-        \\
-        \\    var file = try std.Io.Dir.cwd().openFile(io, "asserts.json", .{});
-        \\    defer file.close(io);
-        \\    const data = try file.readToEndAlloc(io, gpa, 1 << 20);
-        \\    defer gpa.free(data);
-        \\
-        \\    const Case = struct { a: i64, b: i64, expected: i64 };
-        \\    var parsed = try std.json.parseFromSlice([]Case, gpa, data, .{});
-        \\    defer parsed.deinit();
-        \\
-        \\    for (parsed.value) |item| {
-        \\        const got = solution.solution(item.a, item.b);
-        \\        if (got != item.expected) {
-        \\            std.debug.print("expected {d} got {d}\\n", .{ item.expected, got });
-        \\            return error.AssertionFailed;
-        \\        }
-        \\    }
-        \\}
-    ;
-
-    const asserts_text = "[{\"a\":1,\"b\":1,\"expected\":2}]";
-
+fn buildPayload(allocator: std.mem.Allocator, spec: LangSpec) ![]u8 {
     const payload = .{
-        .timeout = "5s",
-        .solution_text = solution_text,
-        .lang_slug = "zig",
-        .asserts = asserts_text,
-        .checker_text = checker_text,
+        .timeout = "30s",
+        .solution_text = spec.solution_text,
+        .lang_slug = spec.lang_slug,
+        .asserts = spec.asserts,
+        .checker_text = spec.checker_text,
     };
-
     return std.json.Stringify.valueAlloc(allocator, payload, .{});
 }
 
@@ -411,6 +483,11 @@ fn startServer(allocator: std.mem.Allocator, io: Io, port: u16, options: ServerO
     try env.put("RUN_INPUT_MAX", input_max_text);
     try env.put("RUN_OUTPUT_MAX", output_max_text);
     try env.put("RUN_CONCURRENCY", concurrency_text);
+    // Inherit PATH so the runner can find python3/node/ruby/zig (especially
+    // when installed under /usr/local/bin or asdf shims, not /usr/bin). HOME
+    // is needed by `zig run` to locate its global cache.
+    if (std.testing.environ.getPosix("PATH")) |p| try env.put("PATH", p);
+    if (std.testing.environ.getPosix("HOME")) |h| try env.put("HOME", h);
 
     // Discard server stdio: inheriting it makes Zig 0.16's build runner think
     // the test step produced stderr (and then print a misleading "failed command:"

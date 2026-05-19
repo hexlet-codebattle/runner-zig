@@ -737,11 +737,13 @@ fn makeTempLayout(gpa: Allocator, io: Io, slot: u6, uid: u32) !TempLayout {
         const target_dir = try tmp_parent.openDir(io, target_name, .{ .iterate = true });
         errdefer (target_dir).close(io);
 
-        if (builtin.os.tag == .linux) {
+        if (isRoot()) {
             // Chown the top-level scratch dir to the slot UID so the unprivileged
             // sandboxed child can chdir/read inside. The workspace tree is copied
             // in next as root; its files inherit root ownership but copyDirRecursive
             // creates dirs as 0o777 and files as 0644 → other (uid) gets read/x.
+            // Non-root (e.g. host-side unit tests) skips this — runCommand will
+            // pick runCommandSimple instead, which runs as the inheriting UID.
             try chownAbsolute(gpa, target_path, uid);
         }
 
@@ -901,8 +903,17 @@ fn childWaiterThread(ctx: ChildWaitCtx) void {
 }
 
 fn runCommand(allocator: Allocator, io: Io, cfg: RunCommandConfig) !RunResult {
-    if (builtin.os.tag == .linux) return runCommandSandboxed(allocator, io, cfg);
+    // Sandboxed path needs root: it calls unshare(CLONE_NEW*) (CAP_SYS_ADMIN)
+    // and the inner child setuid()s to the slot UID. Without root, fall back
+    // to the same simple path macOS uses — correct for host-side unit tests
+    // and for non-privileged dev setups.
+    if (builtin.os.tag == .linux and isRoot()) return runCommandSandboxed(allocator, io, cfg);
     return runCommandSimple(allocator, io, cfg);
+}
+
+fn isRoot() bool {
+    if (builtin.os.tag != .linux) return false;
+    return linux.getuid() == 0;
 }
 
 fn runCommandSimple(allocator: Allocator, io: Io, cfg: RunCommandConfig) !RunResult {

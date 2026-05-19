@@ -1,7 +1,6 @@
 {
   "timeout": "5s",
-  "lang_slug": "zig",
-  "solution_text": "const std = @import(\"std\"); pub fn main() !void { var w = std.io.getStdOut().writer(); try w.print(\"{d}\\n\", .{2+3}); }",
-  "checker_text": "const std = @import(\"std\"); pub fn main() !void { var w = std.io.getStdOut().writer(); try w.print(\"ok\\n\", .{}); }",
-  "asserts": "{\"dummy\":true}"
+  "lang_slug": "python",
+  "solution_text": "import json\nwith open('asserts.json') as f:\n    data = json.load(f)\nfor c in data:\n    print(c['a'] + c['b'])\n",
+  "asserts": "[{\"a\":2,\"b\":3}]"
 }

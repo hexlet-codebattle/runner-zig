@@ -55,9 +55,6 @@ pub fn main(init: std.process.Init) !void {
     const runner_cmd = try resolveRunnerCmd(gpa, io);
     defer runner_cmd.deinit(gpa);
 
-    const workspace_path = try std.process.currentPathAlloc(io, gpa);
-    defer gpa.free(workspace_path);
-
     if (run_concurrency == 0 or run_concurrency > 64) return error.RunConcurrencyOutOfRange;
 
     // Build envp once for the sandboxed child to pass to execve. 0.16 removed
@@ -74,7 +71,6 @@ pub fn main(init: std.process.Init) !void {
         debug_enabled,
         uid_base,
         runner_cmd,
-        workspace_path,
         child_envp,
     );
 
@@ -94,9 +90,6 @@ pub const ServerState = struct {
     output_max: usize,
     debug_enabled: bool,
     runner_cmd: RunnerCmd,
-    /// Absolute path to the runner's working directory; used as the overlayfs
-    /// lower layer on Linux. Borrowed from `main`; lives for the process lifetime.
-    workspace_path: []const u8,
     /// Sentinel-terminated envp built once at startup from `init.environ_map`
     /// and passed to every sandboxed `execve`. 0.16 removed std.os.environ, so
     /// we capture it once instead of reaching for the global.
@@ -111,7 +104,6 @@ pub const ServerState = struct {
         debug_enabled: bool,
         uid_base: u32,
         runner_cmd: RunnerCmd,
-        workspace_path: []const u8,
         child_envp: [:null]?[*:0]const u8,
     ) ServerState {
         const n: u6 = @intCast(run_concurrency);
@@ -127,7 +119,6 @@ pub const ServerState = struct {
             .output_max = output_max,
             .debug_enabled = debug_enabled,
             .runner_cmd = runner_cmd,
-            .workspace_path = workspace_path,
             .child_envp = child_envp,
         };
     }
@@ -345,7 +336,9 @@ fn resolveRunnerCmd(gpa: Allocator, io: Io) !RunnerCmd {
     const raw = try gpa.dupe(u8, trimmed);
     errdefer gpa.free(raw);
     const argv = try gpa.alloc([]const u8, 3);
-    argv[0] = "sh";
+    // Absolute path: runCommandSandboxed execs via raw execve, which does no
+    // PATH lookup. cwd at that point is the overlay mount, which has no `sh`.
+    argv[0] = "/bin/sh";
     argv[1] = "-c";
     argv[2] = raw;
     return .{ .raw = raw, .argv = argv };
@@ -623,21 +616,11 @@ fn runInTemp(
     var layout_to_clean = layout;
     errdefer layout_to_clean.deinit(io, gpa);
 
-    if (builtin.os.tag == .linux) {
-        var inputs = try Io.Dir.openDirAbsolute(io, layout.inputs_path.?, .{});
-        defer inputs.close(io);
-        try writeInputs(io, inputs, lang, data);
-    } else {
-        try copyWorkspace(io, layout.target_dir);
-        try writeInputs(io, layout.target_dir, lang, data);
-    }
+    try copyWorkspace(io, layout.target_dir);
+    try writeInputs(io, layout.target_dir, lang, data);
 
     const cfg = RunCommandConfig{
         .target_path = layout.target_path,
-        .upper_path = layout.upper_path,
-        .work_path = layout.work_path,
-        .inputs_path = layout.inputs_path,
-        .workspace_path = state.workspace_path,
         .uid = uid,
         .timeout_ns = timeout_ns,
         .output_max = state.output_max,
@@ -692,18 +675,9 @@ const RunResult = struct {
 };
 
 const RunCommandConfig = struct {
-    /// Where the child will run (cwd for `runCommandSimple`; the overlayfs
-    /// mount target for `runCommandSandboxed`).
+    /// Per-request working dir: a fresh /tmp/runner-N-XXX populated by copying
+    /// the runner's workspace and then writing the request's input files.
     target_path: []const u8,
-    /// Overlayfs writable layer (Linux only).
-    upper_path: ?[]const u8,
-    /// Overlayfs work dir (Linux only).
-    work_path: ?[]const u8,
-    /// Where solution/checker/asserts live before being surfaced via overlay
-    /// (Linux only).
-    inputs_path: ?[]const u8,
-    /// Absolute path to the runner's workspace; lowerdir for the overlay.
-    workspace_path: []const u8,
     /// UID the child runs as. Equals `state.uid_base + slot` on Linux; ignored
     /// on other targets (which just inherit).
     uid: u32,
@@ -714,21 +688,12 @@ const RunCommandConfig = struct {
     envp: [:null]?[*:0]const u8,
 };
 
-/// On Linux: `target_dir` is the mount point for an overlayfs that will be
-/// established inside the child's mount namespace, with `inputs_path` and
-/// `state.workspace_path` as lower layers and `upper_path` as the writable
-/// layer. All four dirs are chmodded `0700` and chowned to the run's UID so
-/// other concurrent runs cannot see or modify them.
-///
-/// On other targets: only `target_dir`/`target_path` are populated; the
-/// workspace is copied in via `copyWorkspace` and the child runs as the
-/// inheriting UID (development convenience).
+/// Per-request scratch dir under /tmp, populated by copying the runner's
+/// workspace and writing the request's input files. On Linux it is chowned to
+/// the slot's UID so the unprivileged sandboxed child can read/write inside.
 const TempLayout = struct {
     target_path: []u8,
     target_dir: Io.Dir,
-    upper_path: ?[]u8 = null,
-    work_path: ?[]u8 = null,
-    inputs_path: ?[]u8 = null,
 
     /// Idempotent: safe to call multiple times. After the first call (or after
     /// `scheduleCleanup` moves the contents to a heap copy) this is a no-op.
@@ -737,18 +702,6 @@ const TempLayout = struct {
         self.target_dir.close(io);
         deleteTreeAbsolute(io, self.target_path) catch {};
         gpa.free(self.target_path);
-        if (self.upper_path) |p| {
-            deleteTreeAbsolute(io, p) catch {};
-            gpa.free(p);
-        }
-        if (self.work_path) |p| {
-            deleteTreeAbsolute(io, p) catch {};
-            gpa.free(p);
-        }
-        if (self.inputs_path) |p| {
-            deleteTreeAbsolute(io, p) catch {};
-            gpa.free(p);
-        }
         self.* = .{ .target_path = &.{}, .target_dir = .{ .handle = -1 } };
     }
 };
@@ -784,48 +737,15 @@ fn makeTempLayout(gpa: Allocator, io: Io, slot: u6, uid: u32) !TempLayout {
         const target_dir = try tmp_parent.openDir(io, target_name, .{ .iterate = true });
         errdefer (target_dir).close(io);
 
-        if (builtin.os.tag != .linux) {
-            return .{ .target_path = target_path, .target_dir = target_dir };
+        if (builtin.os.tag == .linux) {
+            // Chown the top-level scratch dir to the slot UID so the unprivileged
+            // sandboxed child can chdir/read inside. The workspace tree is copied
+            // in next as root; its files inherit root ownership but copyDirRecursive
+            // creates dirs as 0o777 and files as 0644 → other (uid) gets read/x.
+            try chownAbsolute(gpa, target_path, uid);
         }
 
-        // Linux: create sibling dirs for overlayfs upper/work + inputs staging,
-        // then chown all four to the run's UID and tighten to 0700.
-        const upper_name = try std.fmt.allocPrint(gpa, "{s}-up", .{target_name});
-        defer gpa.free(upper_name);
-        const work_name = try std.fmt.allocPrint(gpa, "{s}-wk", .{target_name});
-        defer gpa.free(work_name);
-        const inputs_name = try std.fmt.allocPrint(gpa, "{s}-in", .{target_name});
-        defer gpa.free(inputs_name);
-
-        try tmp_parent.createDir(io, upper_name, .fromMode(0o700));
-        errdefer tmp_parent.deleteDir(io, upper_name) catch {};
-        try tmp_parent.createDir(io, work_name, .fromMode(0o700));
-        errdefer tmp_parent.deleteDir(io, work_name) catch {};
-        try tmp_parent.createDir(io, inputs_name, .fromMode(0o700));
-        errdefer tmp_parent.deleteDir(io, inputs_name) catch {};
-
-        const upper_path = try std.fmt.allocPrint(gpa, "/tmp/{s}", .{upper_name});
-        errdefer gpa.free(upper_path);
-        const work_path = try std.fmt.allocPrint(gpa, "/tmp/{s}", .{work_name});
-        errdefer gpa.free(work_path);
-        const inputs_path = try std.fmt.allocPrint(gpa, "/tmp/{s}", .{inputs_name});
-        errdefer gpa.free(inputs_path);
-
-        // chown each dir to the slot UID so the unprivileged child can write
-        // (upper) and access its merged view (target). Root keeps the ability
-        // to populate `inputs_path` via CAP_DAC_OVERRIDE.
-        try chownAbsolute(gpa, target_path, uid);
-        try chownAbsolute(gpa, upper_path, uid);
-        try chownAbsolute(gpa, work_path, uid);
-        try chownAbsolute(gpa, inputs_path, uid);
-
-        return .{
-            .target_path = target_path,
-            .target_dir = target_dir,
-            .upper_path = upper_path,
-            .work_path = work_path,
-            .inputs_path = inputs_path,
-        };
+        return .{ .target_path = target_path, .target_dir = target_dir };
     }
 
     return error.TempDirUnavailable;
@@ -1101,14 +1021,6 @@ fn runCommandSandboxed(allocator: Allocator, io: Io, cfg: RunCommandConfig) !Run
     // Pre-build NUL-terminated path strings; we can't allocate after fork.
     const target_path_z = try allocator.dupeZ(u8, cfg.target_path);
     defer allocator.free(target_path_z);
-    const overlay_opts_z = try buildOverlayOptions(
-        allocator,
-        cfg.inputs_path.?,
-        cfg.workspace_path,
-        cfg.upper_path.?,
-        cfg.work_path.?,
-    );
-    defer allocator.free(overlay_opts_z);
     const uid_for_child: posix.uid_t = @intCast(cfg.uid);
 
     // Pipes for child stdout/stderr. `*_write_closed` flips to true once the parent
@@ -1142,10 +1054,10 @@ fn runCommandSandboxed(allocator: Allocator, io: Io, cfg: RunCommandConfig) !Run
         _ = linux.close(stderr_pipe[0]);
         _ = linux.setpgid(0, 0);
 
-        unshareNamespaces() catch linux.exit(127);
+        unshareNamespaces() catch sandboxFatal(stderr_pipe[1], "unshare", 121);
 
         const child_rc = linux.fork();
-        if (linux.errno(child_rc) != .SUCCESS) linux.exit(127);
+        if (linux.errno(child_rc) != .SUCCESS) sandboxFatal(stderr_pipe[1], "fork", 122);
         const child_pid: posix.pid_t = @bitCast(@as(u32, @truncate(child_rc)));
 
         if (child_pid == 0) {
@@ -1161,17 +1073,6 @@ fn runCommandSandboxed(allocator: Allocator, io: Io, cfg: RunCommandConfig) !Run
             _ = linux.close(stdout_pipe[1]);
             _ = linux.close(stderr_pipe[1]);
 
-            // Establish the overlayfs at target_path before chdir + drop privs.
-            // This needs root + the namespace's private mount propagation,
-            // which we set up in `unshareNamespaces`.
-            if (linux.errno(linux.mount(
-                "overlay",
-                target_path_z.ptr,
-                "overlay",
-                0,
-                @intFromPtr(overlay_opts_z.ptr),
-            )) != .SUCCESS) linux.exit(127);
-
             _ = linux.chdir(target_path_z.ptr);
             _ = linux.setgid(uid_for_child);
             _ = linux.setuid(uid_for_child);
@@ -1179,7 +1080,7 @@ fn runCommandSandboxed(allocator: Allocator, io: Io, cfg: RunCommandConfig) !Run
             applyRlimits(cfg.timeout_ns);
 
             _ = linux.execve(argv_z[0].?, @ptrCast(argv_z.ptr), @ptrCast(cfg.envp.ptr));
-            linux.exit(127);
+            sandboxFatal(2, "execve /bin/sh", 124);
         }
 
         // Outer-child: wait for inner-child, propagate exit code.
@@ -1189,7 +1090,7 @@ fn runCommandSandboxed(allocator: Allocator, io: Io, cfg: RunCommandConfig) !Run
             const e = linux.errno(r);
             if (e == .SUCCESS) break;
             if (e == .INTR) continue;
-            linux.exit(127);
+            sandboxFatal(stderr_pipe[1], "waitpid inner", 125);
         }
         const code = decodeExitCode(status) orelse 255;
         linux.exit(@intCast(@min(code, 255)));
@@ -1285,19 +1186,17 @@ fn runCommandSandboxed(allocator: Allocator, io: Io, cfg: RunCommandConfig) !Run
     };
 }
 
-/// Builds the overlayfs `lowerdir=...:...,upperdir=...,workdir=...` mount data
-/// as a NUL-terminated string. The inputs dir is the leftmost lower, so its
-/// solution/checker files override anything that might exist in the workspace.
-fn buildOverlayOptions(
-    gpa: Allocator,
-    inputs_path: []const u8,
-    workspace_path: []const u8,
-    upper_path: []const u8,
-    work_path: []const u8,
-) ![:0]u8 {
-    return std.fmt.allocPrintSentinel(gpa, "lowerdir={s}:{s},upperdir={s},workdir={s}", .{
-        inputs_path, workspace_path, upper_path, work_path,
-    }, 0);
+/// Diagnostic helper for the sandboxed child: write a short tag to `fd`,
+/// then exit with `code`. Uses raw write+exit only (post-fork, must be
+/// async-signal-safe). `fd` is typically 2 (stderr) once dup2 has run, or the
+/// stderr-pipe write end before stdio is set up.
+fn sandboxFatal(fd: i32, tag: []const u8, code: u8) noreturn {
+    const prefix: []const u8 = "sandbox: ";
+    const nl: []const u8 = "\n";
+    _ = linux.write(fd, prefix.ptr, prefix.len);
+    _ = linux.write(fd, tag.ptr, tag.len);
+    _ = linux.write(fd, nl.ptr, nl.len);
+    linux.exit(code);
 }
 
 fn unshareNamespaces() !void {

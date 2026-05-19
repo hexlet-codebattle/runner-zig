@@ -1,5 +1,5 @@
 ARG ZIG_VERSION=0.16.0
-ARG ALPINE_VERSION=3.23
+ARG UBUNTU_VERSION=latest
 ARG ZIG_URL=
 ARG PORT=4040
 ARG RUN_CONCURRENCY=32
@@ -9,7 +9,7 @@ ARG DEBUG=
 ARG ALLOW_SHUTDOWN=
 
 # Build stage
-FROM --platform=$BUILDPLATFORM alpine:${ALPINE_VERSION} AS builder
+FROM --platform=$BUILDPLATFORM ubuntu:${UBUNTU_VERSION} AS builder
 WORKDIR /build
 
 ARG ZIG_VERSION
@@ -17,7 +17,11 @@ ARG ZIG_URL
 ARG TARGETPLATFORM
 ARG TARGETARCH
 
-RUN apk add --no-cache curl tar xz make ca-certificates python3
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        curl tar xz-utils make ca-certificates python3 && \
+    rm -rf /var/lib/apt/lists/*
 
 RUN if [ -z "$TARGETARCH" ]; then \
     case "$(uname -m)" in \
@@ -47,7 +51,7 @@ COPY . .
 RUN zig build -Doptimize=ReleaseSafe
 
 # Runtime stage
-FROM alpine:${ALPINE_VERSION}
+FROM ubuntu:${UBUNTU_VERSION}
 WORKDIR /app
 ARG PORT
 ARG RUN_CONCURRENCY
@@ -55,7 +59,10 @@ ARG RUN_INPUT_MAX
 ARG RUN_OUTPUT_MAX
 ARG DEBUG
 ARG ALLOW_SHUTDOWN
-RUN apk add --no-cache make python3
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends make ca-certificates python3 && \
+    rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build /app
 RUN cp /app/zig-out/bin/runner-zig /app/codebattle_runner
 ENV PORT=$PORT \

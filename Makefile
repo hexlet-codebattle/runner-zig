@@ -18,9 +18,10 @@ lint:
 lint-fix:
 	zig fmt src
 
-## fake check
+## Recipe used by the runner: execute the python solution against asserts.json.
+## `make -n test` (run at startup) resolves this to the shell command every /run dispatches.
 test:
-	ls -la
+	cd check && python3 solution.py
 
 ## Run integration tests inside the builder container
 test-unit:
@@ -34,27 +35,46 @@ test-leak:
 	RUNNER_RSS_BULK=10000 RUNNER_RSS_MAX_KB_PER_REQ=1 RUNNER_RSS_MIN_FLOOR_KB=1024 \
 		zig build test --summary all
 
-## Run integration tests against an already-built container (container + HTTP checks)
+## Build alpine + ubuntu images and run the python a+b integration suite against each.
 test-integration:
-	@container_name="runner-zig-it-$$RANDOM"; \
-	container_started=0; \
-	trap 'if [ $$container_started -eq 1 ]; then $(CONTAINER) stop $$container_name >/dev/null 2>&1 || true; fi' EXIT; \
+	$(CONTAINER) build --file Containerfile --tag $(IMAGE):alpine-it .
+	@$(MAKE) --no-print-directory _run-integration IMG_REF=$(IMAGE):alpine-it FLAVOR=alpine
+	$(CONTAINER) build --file Containerfile.ubuntu --tag $(IMAGE):ubuntu-it .
+	@$(MAKE) --no-print-directory _run-integration IMG_REF=$(IMAGE):ubuntu-it FLAVOR=ubuntu
+
+## Private: run the python a+b smoke test against a pre-built image.
+## Invoked by test-integration once per flavor; takes IMG_REF and FLAVOR.
+## Asserts /run returns exit_code:0 stdout:"5\n" for a single request and for
+## every request of a 30-way parallel burst.
+_run-integration:
+	@container_name="runner-zig-it-$(FLAVOR)-$$RANDOM"; \
+	trap "$(CONTAINER) stop $$container_name >/dev/null 2>&1 || true" EXIT; \
+	echo "==== integration ($(FLAVOR)): $(IMG_REF) ===="; \
 	$(CONTAINER) run -d --rm --pull=never --name $$container_name -p 4040:4040 \
 		--cap-add=SYS_ADMIN \
 		--cap-add=SYS_CHROOT \
 		--security-opt=no-new-privileges=false \
 		-e DEBUG=true \
-		$(IMAGE):$(TAG) >/dev/null && \
-	container_started=1; \
+		$(IMG_REF) >/dev/null; \
 	for i in 1 2 3 4 5; do \
-		if $(MAKE) --no-print-directory curl-local-health >/dev/null; then break; fi; \
+		if curl -fsS http://localhost:4040/health >/dev/null 2>&1; then break; fi; \
 		sleep 1; \
 	done; \
-	$(MAKE) --no-print-directory curl-local-health && \
-	seq 1 60 | xargs -n1 -P60 sh -c 'curl -sS -o /dev/null -w "%{http_code}\n" http://localhost:4040/run -H "content-type: application/json" -d @test-payload.json' | sort | uniq -c; \
-	echo "---- container logs (tail) ----"; \
-	$(CONTAINER) logs --tail 80 $$container_name 2>&1 | tail -80; \
-	if [ $$container_started -eq 1 ]; then $(CONTAINER) stop $$container_name >/dev/null 2>&1 || true; fi
+	curl -fsS http://localhost:4040/health >/dev/null || { echo "FAIL: health check"; exit 1; }; \
+	echo "-- single request --"; \
+	body=$$(curl -sS http://localhost:4040/run -H 'content-type: application/json' -d @test-payload.json); \
+	printf '  %s\n' "$$body"; \
+	pass=1; \
+	printf '%s' "$$body" | grep -q '"exit_code":0,"stdout":"5\\n","stderr":""' \
+		|| { printf '  FAIL: response did not match {exit_code:0, stdout:"5\\\\n", stderr:""}\n'; pass=0; }; \
+	echo "-- 30 parallel runs --"; \
+	ok=$$(seq 1 30 | xargs -n1 -P30 sh -c 'b=$$(curl -sS http://localhost:4040/run -H "content-type: application/json" -d @test-payload.json); printf "%s\n" "$$b"' | grep -c '"exit_code":0,"stdout":"5\\n","stderr":""'); \
+	printf '  %d/30 returned the expected body\n' "$$ok"; \
+	[ "$$ok" = "30" ] || pass=0; \
+	echo "---- container logs (tail 40) ----"; \
+	$(CONTAINER) logs --tail 40 $$container_name 2>&1 | tail -40; \
+	[ "$$pass" = "1" ] || { echo "==== FAIL ($(FLAVOR)) ===="; exit 1; }; \
+	echo "==== PASS ($(FLAVOR)) ===="
 
 ## Build and push multi-arch image (linux/amd64 + linux/arm64) for GHCR
 build-and-push: container-build container-push

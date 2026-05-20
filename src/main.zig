@@ -1065,7 +1065,8 @@ fn runCommandSandboxed(allocator: Allocator, io: Io, cfg: RunCommandConfig) !Run
         _ = linux.close(stderr_pipe[0]);
         _ = linux.setpgid(0, 0);
 
-        unshareNamespaces() catch sandboxFatal(stderr_pipe[1], "unshare", 121);
+        const unshare_errno = unshareNamespaces();
+        if (unshare_errno != .SUCCESS) sandboxFatalErrno(stderr_pipe[1], "unshare", unshare_errno, 121);
 
         const child_rc = linux.fork();
         if (linux.errno(child_rc) != .SUCCESS) sandboxFatal(stderr_pipe[1], "fork", 122);
@@ -1210,11 +1211,30 @@ fn sandboxFatal(fd: i32, tag: []const u8, code: u8) noreturn {
     linux.exit(code);
 }
 
-fn unshareNamespaces() !void {
+/// Like sandboxFatal, but also prints the numeric errno.
+fn sandboxFatalErrno(fd: i32, tag: []const u8, err: linux.E, code: u8) noreturn {
+    const prefix: []const u8 = "sandbox: ";
+    const sep: []const u8 = " errno=";
+    const nl: []const u8 = "\n";
+    _ = linux.write(fd, prefix.ptr, prefix.len);
+    _ = linux.write(fd, tag.ptr, tag.len);
+    _ = linux.write(fd, sep.ptr, sep.len);
+    var buf: [16]u8 = undefined;
+    const n = std.fmt.printInt(&buf, @intFromEnum(err), 10, .lower, .{});
+    _ = linux.write(fd, &buf, n);
+    _ = linux.write(fd, nl.ptr, nl.len);
+    linux.exit(code);
+}
+
+/// Returns errno on failure; SUCCESS on success.
+fn unshareNamespaces() linux.E {
     const flags = linux.CLONE.NEWNS | linux.CLONE.NEWPID | linux.CLONE.NEWIPC | linux.CLONE.NEWUTS | linux.CLONE.NEWNET;
-    if (linux.errno(linux.unshare(flags)) != .SUCCESS) return error.UnshareFailed;
+    const e1 = linux.errno(linux.unshare(flags));
+    if (e1 != .SUCCESS) return e1;
     const root: [:0]const u8 = "/";
-    if (linux.errno(linux.mount(null, root.ptr, null, linux.MS.REC | linux.MS.PRIVATE, 0)) != .SUCCESS) return error.MountPrivateFailed;
+    const e2 = linux.errno(linux.mount(null, root.ptr, null, linux.MS.REC | linux.MS.PRIVATE, 0));
+    if (e2 != .SUCCESS) return e2;
+    return .SUCCESS;
 }
 
 fn applyRlimits(timeout_ns: u64) void {

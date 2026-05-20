@@ -74,6 +74,12 @@ Environment variables:
 - `RUN_INPUT_MAX` (default `1048576` bytes): Max request body size.
 - `RUN_OUTPUT_MAX` (default `1048576` bytes): Max bytes allowed per stream (0 disables the limit).
 - `DEBUG` (default `false`): Enable request header logging; empty value enables it too.
+- `RUN_UID_BASE` (default `10001`): Per-slot run UID is `RUN_UID_BASE + slot_index`.
+- `RUN_ENV_ALLOW` (default empty): Comma-separated list of additional env keys to forward to user code. The baseline allowlist is `PATH`, `LANG`, `LC_ALL`, `TZ`; `HOME` is always force-set to `/sandbox`. Anything not on either list is dropped, so operator secrets in env never reach the sandbox.
+- `RUN_MEMORY_MAX` (default `0` = disabled): If non-zero, applies `RLIMIT_AS` (bytes) to user code. Opt-in because JVM/.NET/Go reserve enormous virtual address space upfront. Prefer the container's memory cgroup over `RLIMIT_AS` when possible.
+- `RUN_TMP_SIZE_<UPPER_SLUG>` (no default; per-lang override): `size=` for the per-request /tmp tmpfs for a specific language, e.g. `RUN_TMP_SIZE_CSHARP=2g`, `RUN_TMP_SIZE_JAVA=256m`. Highest precedence.
+- `RUN_SANDBOX_TMP_SIZE` (no default; global fallback): `size=` applied to every lang that doesn't have its own `RUN_TMP_SIZE_<SLUG>` override.
+- Per-lang defaults (when neither env above is set) are baked into `all_langs` in `src/main.zig`. Current values: 64m for interpreted langs (python, js, ts, ruby, php), 128m for moderate compiles (cpp, zig, java, dart, elixir), 256m for heavier toolchains (rust, swift, haskell, golang, kotlin, clojure), and 1g for csharp.
 
 ## Timeout Rules
 `timeout` accepts a string with units: `ms`, `s`, or `m` (defaults to `30s` when omitted).
@@ -83,16 +89,36 @@ Environment variables:
 - Output limit: `RUN_OUTPUT_MAX` per stream (HTTP 413 when exceeded).
 
 ## Isolation and Safety
-- The execution occurs in a temporary directory under `/tmp` built by copying the current workspace.
-- The service runs commands in a separate process group for reliable termination.
-- On Linux, each run is executed in new namespaces (PID, mount, IPC, UTS, NET) and drops to UID/GID 10001.
-- Network is disabled by placing the run in a new network namespace with no interfaces.
-- Resource limits (rlimits) are applied in the sandboxed child:
-  - `RLIMIT_CPU`: equals the request timeout (rounded up to whole seconds).
-  - `RLIMIT_NOFILE`: 256 open files.
-  - `RLIMIT_NPROC`: 256 processes/threads.
-  - `RLIMIT_CORE`: 0 (no core dumps).
-- Rationale for `256` limits: high enough for typical compilers/builds while preventing FD/process exhaustion; these can be tuned in code if needed.
+On Linux when running as root (the production deployment), each `/run` request is executed in a fresh sandbox:
+
+**Namespaces (per request).** New PID, mount, IPC, UTS, and network namespaces via `unshare(2)`. Root mount propagation is set private. The new netns has no interfaces, so user code has no network even if a pod-level egress rule is misconfigured.
+
+**Mount-namespace masking (per request, ~4 mount syscalls).** Performed in the outer child after `unshare`, before the inner fork:
+- `/tmp/runner-N-XXX` (the per-request workspace) is bind-mounted to `/sandbox`. The inner child `chdir`s to `/sandbox`, so the original `/tmp/...` path becomes irrelevant.
+- `tmpfs` is mounted over `/tmp` (`MS_NOSUID | MS_NODEV`, per-lang `size=` resolved from `RUN_TMP_SIZE_<SLUG>` env > `RUN_SANDBOX_TMP_SIZE` env > per-lang code default in `all_langs`). This hides every other slot's workspace and side-steps the async-cleanup window — even if the previous request's `/tmp/runner-N-YYY` hasn't been deleted yet, it's invisible in this namespace. The size cap bounds how much RAM a single request can pin via /tmp writes; the budget is calibrated per-lang because (e.g.) dotnet builds need ~1g of intermediate state while a Python solution needs only a few MB.
+- `tmpfs` (RO, empty) is mounted over `/app`. Hides the runner's own source from user code without affecting the runner process itself.
+- Fresh `procfs` is mounted on `/proc` (`MS_NOSUID | MS_NODEV | MS_NOEXEC`). Required because the new PID namespace would otherwise still expose the host's procfs view via the inherited mount.
+
+**Privilege drop.** The inner child does `setgid` + `setuid` to `RUN_UID_BASE + slot` (default 10001+N), then `PR_SET_NO_NEW_PRIVS`. The outer (PID 1 of the new pid_ns) stays as root only long enough to `waitpid` the inner child.
+
+**Environment.** Only an explicit allowlist of keys is passed to `execve` (see `RUN_ENV_ALLOW` above). Operator-injected secrets like `DB_PASSWORD` or `API_KEY` never reach user code. `HOME` is force-set to `/sandbox`.
+
+**Seccomp-bpf denylist.** Installed in the inner child after `PR_SET_NO_NEW_PRIVS` and before `execve`. Verdict is `SECCOMP_RET_KILL_PROCESS` for any of: `mount`, `umount2`, `pivot_root`, `chroot`, `unshare`, `setns`, `seccomp`, `bpf`, `keyctl`, `add_key`, `request_key`, `init_module`, `finit_module`, `delete_module`, `kexec_load`, `kexec_file_load`, `swapon`, `swapoff`, `reboot`, `acct`, `quotactl`, `perf_event_open`, `ptrace`, `process_vm_readv`, `process_vm_writev`, `kcmp`, `userfaultfd`, `iopl`, `ioperm`, `name_to_handle_at`, `open_by_handle_at`, `lookup_dcookie`, `nfsservctl`, `io_uring_setup`, `io_uring_enter`, `io_uring_register`, `personality`. Filter starts with an arch audit that kills the process on any non-native syscall ABI (blocks 32-bit-compat ABI-confusion attacks).
+
+**Rlimits applied in the inner child:**
+- `RLIMIT_CPU`: equals the request timeout (rounded up to whole seconds).
+- `RLIMIT_NOFILE`: 256 open files.
+- `RLIMIT_NPROC`: 256 processes/threads.
+- `RLIMIT_CORE`: 0 (no core dumps).
+- `RLIMIT_AS`: only if `RUN_MEMORY_MAX` is set; otherwise rely on the container's memory cgroup.
+
+**Cross-tenant guarantee.** Two requests cannot read each other's workspaces because (a) different slots run as different UIDs and per-slot temp dirs are mode 0700, and (b) the per-request mount-ns tmpfs over `/tmp` makes other slots' workspace paths invisible regardless of UID. Background cleanup race is not exploitable.
+
+**Out of scope for the runner itself** (handled at deploy/infra layer):
+- Memory limits via cgroup v2 (`memory.max`).
+- Kernel-escape isolation (Firecracker / gVisor / Kata).
+- Host-level CPU isolation / dedicated worker nodes.
+- Egress firewalling (the runner unshares netns as defense in depth, but the pod should still block egress).
 
 ## Runtime Notes
 - The service is stateless; each request creates a fresh temp workspace and cleans it up after execution.

@@ -60,6 +60,7 @@ _run-integration:
 	$(CONTAINER) run -d --rm --pull=never --name $$container_name -p 4040:4040 \
 		--cap-add=SYS_ADMIN \
 		--cap-add=SYS_CHROOT \
+		--security-opt=seccomp=unconfined \
 		--security-opt=no-new-privileges=false \
 		-e DEBUG=true \
 		$(IMG_REF) >/dev/null; \
@@ -110,6 +111,7 @@ container-start:
 	$(CONTAINER) run --rm -p 4040:4040 \
 		--cap-add=SYS_ADMIN \
 		--cap-add=SYS_CHROOT \
+		--security-opt=seccomp=unconfined \
 		--security-opt=no-new-privileges=false \
 		$(IMAGE):$(TAG)
 

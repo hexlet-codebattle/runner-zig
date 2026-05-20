@@ -58,6 +58,8 @@ ARG ALLOW_SHUTDOWN
 RUN apk add --no-cache make python3
 COPY --from=builder /build /app
 RUN cp /app/zig-out/bin/runner-zig /app/codebattle_runner
+# Bind-mount target for per-request workspace; see setupSandboxMounts.
+RUN mkdir -m 0755 /sandbox
 ENV PORT=$PORT \
     RUN_CONCURRENCY=$RUN_CONCURRENCY \
     RUN_INPUT_MAX=$RUN_INPUT_MAX \

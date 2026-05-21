@@ -584,10 +584,17 @@ fn handleRun(allocator: Allocator, gpa: Allocator, io: Io, req: *std.http.Server
         try sendJson(req, .too_many_requests, "{\"error\":\"runner busy\"}");
         return;
     };
-    defer state.releaseSlot(slot);
 
     const start_ts = Io.Timestamp.now(io, .awake);
-    const result = runInTemp(allocator, gpa, io, state, slot, lang, data, timeout_ns) catch |err| {
+    // Release the slot the moment the run completes — before JSON
+    // serialization, before sendJson writes to the socket, before the
+    // function returns. Otherwise a client firing the next request the
+    // instant it receives a response can arrive before our `defer` would
+    // have released the slot, hitting a spurious 429. The slot represents
+    // "an in-flight run", not "the entire HTTP exchange."
+    const result_or_err = runInTemp(allocator, gpa, io, state, slot, lang, data, timeout_ns);
+    state.releaseSlot(slot);
+    const result = result_or_err catch |err| {
         switch (err) {
             error.OutputTooLarge => {
                 try sendJson(req, .payload_too_large, "{\"error\":\"output too large\"}");

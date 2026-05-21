@@ -79,7 +79,11 @@ Environment variables:
 - `RUN_MEMORY_MAX` (default `0` = disabled): If non-zero, applies `RLIMIT_AS` (bytes) to user code. Opt-in because JVM/.NET/Go reserve enormous virtual address space upfront. Prefer the container's memory cgroup over `RLIMIT_AS` when possible.
 - `RUN_TMP_SIZE_<UPPER_SLUG>` (no default; per-lang override): `size=` for the per-request /tmp tmpfs for a specific language, e.g. `RUN_TMP_SIZE_CSHARP=2g`, `RUN_TMP_SIZE_JAVA=256m`. Highest precedence.
 - `RUN_SANDBOX_TMP_SIZE` (no default; global fallback): `size=` applied to every lang that doesn't have its own `RUN_TMP_SIZE_<SLUG>` override.
-- Per-lang defaults (when neither env above is set) are baked into `all_langs` in `src/main.zig`. Current values: 64m for interpreted langs (python, js, ts, ruby, php), 128m for moderate compiles (cpp, zig, java, dart, elixir), 256m for heavier toolchains (rust, swift, haskell, golang, kotlin, clojure), and 1g for csharp.
+- Per-lang defaults (when neither env above is set) are baked into `all_langs` in `src/main.zig`. Current values:
+  - **Popular langs (generous):** python 256m, cpp 512m, golang 512m, java 256m.
+  - Other interpreted (js, ts, ruby, php): 64m.
+  - Other native (zig, dart): 128m. JVM family (kotlin, clojure) and Rust/Swift/Haskell/Elixir: 256m.
+  - csharp: 1g.
 
 ## Timeout Rules
 `timeout` accepts a string with units: `ms`, `s`, or `m` (defaults to `30s` when omitted).

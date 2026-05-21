@@ -38,26 +38,28 @@ const LangConfig = struct {
 };
 
 const all_langs = [_]LangConfig{
-    // Interpreted / lightweight runtimes: minimal /tmp use.
-    .{ .slug = "python",  .dir = "check", .solution = "solution.py",  .checker = null,             .checker_required = false, .tmp_size = "64m" },
+    // Sizes are generous on purpose for the popular langs (python/cpp/golang/
+    // java); the pod's memory cgroup is the real ceiling, and tmpfs pages are
+    // lazy, so over-provisioning costs nothing at idle.
+    .{ .slug = "python",  .dir = "check", .solution = "solution.py",  .checker = null,             .checker_required = false, .tmp_size = "256m" },
     .{ .slug = "js",      .dir = "check", .solution = "solution.js",  .checker = null,             .checker_required = false, .tmp_size = "64m" },
     .{ .slug = "ts",      .dir = "check", .solution = "solution.js",  .checker = null,             .checker_required = false, .tmp_size = "64m" },
     .{ .slug = "ruby",    .dir = "check", .solution = "solution.rb",  .checker = null,             .checker_required = false, .tmp_size = "64m" },
     .{ .slug = "php",     .dir = "check", .solution = "solution.php", .checker = null,             .checker_required = false, .tmp_size = "64m" },
     .{ .slug = "elixir",  .dir = "check", .solution = "solution.exs", .checker = null,             .checker_required = false, .tmp_size = "128m" },
     .{ .slug = "clojure", .dir = "check", .solution = "solution.clj", .checker = null,             .checker_required = false, .tmp_size = "256m" },
-    // Native single-file compiles: small intermediate files.
-    .{ .slug = "cpp",     .dir = "check", .solution = "solution.cpp", .checker = "checker.cpp",    .checker_required = true,  .tmp_size = "128m" },
+    // Native compiles.
+    .{ .slug = "cpp",     .dir = "check", .solution = "solution.cpp", .checker = "checker.cpp",    .checker_required = true,  .tmp_size = "512m" },
     .{ .slug = "zig",     .dir = "check", .solution = "solution.zig", .checker = "checker.zig",    .checker_required = true,  .tmp_size = "128m" },
     .{ .slug = "rust",    .dir = "check", .solution = "solution.rs",  .checker = "checker.rs",     .checker_required = true,  .tmp_size = "256m" },
     .{ .slug = "swift",   .dir = "check", .solution = "solution.swift", .checker = "checker.swift",.checker_required = true,  .tmp_size = "256m" },
     .{ .slug = "haskell", .dir = "check", .solution = "Solution.hs",  .checker = "Checker.hs",     .checker_required = true,  .tmp_size = "256m" },
-    .{ .slug = "golang",  .dir = "check", .solution = "solution.go",  .checker = "checker.go",     .checker_required = true,  .tmp_size = "256m" },
+    .{ .slug = "golang",  .dir = "check", .solution = "solution.go",  .checker = "checker.go",     .checker_required = true,  .tmp_size = "512m" },
     .{ .slug = "dart",    .dir = "lib",   .solution = "solution.dart", .checker = "checker.dart",  .checker_required = true,  .tmp_size = "128m" },
-    // JVM family: heavier per-invocation tmpfs.
-    .{ .slug = "java",    .dir = "check", .solution = "Solution.java", .checker = "Checker.java", .checker_required = true,  .tmp_size = "128m" },
+    // JVM family.
+    .{ .slug = "java",    .dir = "check", .solution = "Solution.java", .checker = "Checker.java", .checker_required = true,  .tmp_size = "256m" },
     .{ .slug = "kotlin",  .dir = "check", .solution = "solution.kt",  .checker = "checker.kt",     .checker_required = true,  .tmp_size = "256m" },
-    // .NET: dotnet build is the heaviest single-file workload we host.
+    // .NET: heaviest single-file workload we host.
     .{ .slug = "csharp",  .dir = "check", .solution = "Solution.cs",  .checker = "Checker.cs",     .checker_required = true,  .tmp_size = "1g" },
 };
 
@@ -1181,8 +1183,20 @@ fn runCommandSandboxed(allocator: Allocator, gpa: Allocator, io: Io, cfg: RunCom
         _ = linux.close(stderr_pipe[0]);
         _ = linux.setpgid(0, 0);
 
-        const unshare_errno = unshareNamespaces();
-        if (unshare_errno != .SUCCESS) sandboxFatalErrno(stderr_pipe[1], "unshare", unshare_errno, 121);
+        // Split into two steps so error reports identify which syscall failed.
+        // The MS_PRIVATE remount in particular is denied by Docker's default
+        // AppArmor profile (EACCES) even with CAP_SYS_ADMIN — operators must
+        // run with `--security-opt apparmor=unconfined`.
+        {
+            const unshare_flags = linux.CLONE.NEWNS | linux.CLONE.NEWPID | linux.CLONE.NEWIPC | linux.CLONE.NEWUTS | linux.CLONE.NEWNET;
+            const e = linux.errno(linux.unshare(unshare_flags));
+            if (e != .SUCCESS) sandboxFatalErrno(stderr_pipe[1], "unshare", e, 121);
+        }
+        {
+            const root: [*:0]const u8 = "/";
+            const e = linux.errno(linux.mount(null, root, null, linux.MS.REC | linux.MS.PRIVATE, 0));
+            if (e != .SUCCESS) sandboxFatalErrno(stderr_pipe[1], "ms_private remount /", e, 128);
+        }
 
         // Mount-namespace masking: hides every other slot's workspace, the
         // runner's own source under /app, and gives the new PID namespace a
@@ -1363,17 +1377,6 @@ fn sandboxFatalErrno(fd: i32, tag: []const u8, err: linux.E, code: u8) noreturn 
     linux.exit(code);
 }
 
-/// Returns errno on failure; SUCCESS on success.
-fn unshareNamespaces() linux.E {
-    const flags = linux.CLONE.NEWNS | linux.CLONE.NEWPID | linux.CLONE.NEWIPC | linux.CLONE.NEWUTS | linux.CLONE.NEWNET;
-    const e1 = linux.errno(linux.unshare(flags));
-    if (e1 != .SUCCESS) return e1;
-    const root: [:0]const u8 = "/";
-    const e2 = linux.errno(linux.mount(null, root.ptr, null, linux.MS.REC | linux.MS.PRIVATE, 0));
-    if (e2 != .SUCCESS) return e2;
-    return .SUCCESS;
-}
-
 // --- seccomp filter ---------------------------------------------------------
 // Classic BPF program installed in the inner child after PR_SET_NO_NEW_PRIVS.
 // Kills the user process on any syscall in `denied_syscall_names` below.
@@ -1497,8 +1500,8 @@ fn applySeccompFilter() linux.E {
 /// the original /tmp/runner-N-XXX path becomes invisible (tmpfs over /tmp).
 const sandbox_root: [:0]const u8 = "/sandbox";
 
-/// Per-request mount-namespace masking. Called by the outer child after
-/// `unshareNamespaces`; the inner child inherits the resulting view.
+/// Per-request mount-namespace masking. Called by the outer child after the
+/// unshare + MS_PRIVATE remount; the inner child inherits the resulting view.
 /// Order matters: bind workspace BEFORE tmpfs /tmp, otherwise the tmpfs
 /// would hide the workspace's original /tmp/runner-N-XXX path before we get
 /// a stable reference to its inodes.

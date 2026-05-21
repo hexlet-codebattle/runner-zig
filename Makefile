@@ -61,6 +61,7 @@ _run-integration:
 		--cap-add=SYS_ADMIN \
 		--cap-add=SYS_CHROOT \
 		--security-opt=seccomp=unconfined \
+		--security-opt=apparmor=unconfined \
 		--security-opt=no-new-privileges=false \
 		-e DEBUG=true \
 		$(IMG_REF) >/dev/null; \
@@ -112,6 +113,7 @@ container-start:
 		--cap-add=SYS_ADMIN \
 		--cap-add=SYS_CHROOT \
 		--security-opt=seccomp=unconfined \
+		--security-opt=apparmor=unconfined \
 		--security-opt=no-new-privileges=false \
 		$(IMAGE):$(TAG)
 

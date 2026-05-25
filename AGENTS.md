@@ -97,7 +97,7 @@ On Linux when running as root (the production deployment), each `/run` request i
 
 **Namespaces (per request).** New PID, mount, IPC, UTS, and network namespaces via `unshare(2)`. Root mount propagation is set private. The new netns has no interfaces, so user code has no network even if a pod-level egress rule is misconfigured.
 
-**Mount-namespace masking (per request, ~4 mount syscalls).** Performed in the outer child after `unshare`, before the inner fork:
+**Mount-namespace masking (per request, ~4 mount syscalls).** Performed in the outer child after `unshare`, before the inner fork. The runner mkdirs `/sandbox` and `/app` once at startup (idempotent — EEXIST OK), so the bind/tmpfs targets exist even when the binary is dropped into a foreign base image (e.g. runner-python's `python:alpine`):
 - `/tmp/runner-N-XXX` (the per-request workspace) is bind-mounted to `/sandbox`. The inner child `chdir`s to `/sandbox`, so the original `/tmp/...` path becomes irrelevant.
 - `tmpfs` is mounted over `/tmp` (`MS_NOSUID | MS_NODEV`, per-lang `size=` resolved from `RUN_TMP_SIZE_<SLUG>` env > `RUN_SANDBOX_TMP_SIZE` env > per-lang code default in `all_langs`). This hides every other slot's workspace and side-steps the async-cleanup window — even if the previous request's `/tmp/runner-N-YYY` hasn't been deleted yet, it's invisible in this namespace. The size cap bounds how much RAM a single request can pin via /tmp writes; the budget is calibrated per-lang because (e.g.) dotnet builds need ~1g of intermediate state while a Python solution needs only a few MB.
 - `tmpfs` (RO, empty) is mounted over `/app`. Hides the runner's own source from user code without affecting the runner process itself.

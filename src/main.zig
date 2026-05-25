@@ -116,6 +116,8 @@ pub fn main(init: std.process.Init) !void {
         child_envp,
     );
 
+    ensureSandboxMountTargets();
+
     try serve(gpa, port, &state);
 }
 
@@ -1502,10 +1504,31 @@ fn applySeccompFilter() linux.E {
 }
 
 /// Where the per-request workspace is bind-mounted inside each request's
-/// mount namespace. Must exist in the container's filesystem (Containerfile
-/// creates it). After the bind, user code sees its workspace at /sandbox and
-/// the original /tmp/runner-N-XXX path becomes invisible (tmpfs over /tmp).
+/// mount namespace. Must exist in the container's filesystem; the runner-zig
+/// Containerfile creates it, and `ensureSandboxMountTargets` re-creates it at
+/// startup so the binary also works when copied into a foreign base image
+/// (e.g. python:alpine for runner-python). After the bind, user code sees its
+/// workspace at /sandbox and the original /tmp/runner-N-XXX path becomes
+/// invisible (tmpfs over /tmp).
 const sandbox_root: [:0]const u8 = "/sandbox";
+
+/// Idempotently mkdir the two paths `setupSandboxMounts` mounts onto.
+/// Runner-zig's own Containerfile creates them, but the binary is also embedded
+/// into language-specific runner images via `COPY --from=runner-zig
+/// /app/codebattle_runner …`; those base images (e.g. python:alpine) have
+/// neither /sandbox nor /app, and the bind in setupSandboxMounts then fails
+/// with ENOENT ("sandbox: sandbox mounts errno=2") on the very first /run.
+/// EEXIST is treated as success so an existing dir's permissions are preserved.
+fn ensureSandboxMountTargets() void {
+    if (!isRoot()) return;
+    const targets = [_][*:0]const u8{ "/sandbox", "/app" };
+    for (targets) |path| {
+        const e = linux.errno(linux.mkdir(path, 0o755));
+        if (e != .SUCCESS and e != .EXIST) {
+            std.log.warn("could not create sandbox mount target {s} (errno={d}); /run will fail until this is fixed", .{ std.mem.span(path), @intFromEnum(e) });
+        }
+    }
+}
 
 /// Per-request mount-namespace masking. Called by the outer child after the
 /// unshare + MS_PRIVATE remount; the inner child inherits the resulting view.

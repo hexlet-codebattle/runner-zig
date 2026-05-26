@@ -118,6 +118,18 @@ pub fn main(init: std.process.Init) !void {
 
     ensureSandboxMountTargets();
 
+    // Clear the file-creation umask process-wide. copyDirRecursive then
+    // produces dirs at their full 0o777 mode (not narrowed to 0o755 by the
+    // default 0o022 umask) and writeFile produces files at 0o666. The
+    // workspace tree is reachable only through the slot-owned, 0o700-mode
+    // top-level /tmp/runner-{slot}-{rand}/ created by makeTempLayout — so
+    // "world-writable sub-paths" only matter to the slot UID, which is the
+    // entire point: it lets the sandboxed child write into pre-restored
+    // dirs (.NET's `obj/`, swift's `check/`, cargo's `target/`, …) without
+    // the per-request recursive-chown pass we used to need. Must be
+    // process-wide and set at startup because umask isn't thread-local.
+    if (builtin.os.tag == .linux) _ = linux.syscall1(.umask, 0);
+
     try serve(gpa, port, &state);
 }
 
@@ -726,6 +738,11 @@ fn runInTemp(
     try copyWorkspace(io, layout.target_dir);
     try writeInputs(io, layout.target_dir, lang, data);
 
+    // No per-request chown: the process-wide umask=0 set in `main` lets
+    // copyDirRecursive land sub-dirs at 0o777 so the slot UID (granted via
+    // "other") can create build artefacts inside them. The slot-owned 0o700
+    // top-level dir still gates traversal from outside the slot.
+
     // lookupLangTmpOpts returns the entry built for lang.slug at startup. The
     // request was already validated as a known lang_slug upstream (getLangConfig),
     // so the lookup cannot miss here.
@@ -856,11 +873,13 @@ fn makeTempLayout(gpa: Allocator, io: Io, slot: u6, uid: u32) !TempLayout {
 
         if (isRoot()) {
             // Chown the top-level scratch dir to the slot UID so the unprivileged
-            // sandboxed child can chdir/read inside. The workspace tree is copied
-            // in next as root; its files inherit root ownership but copyDirRecursive
-            // creates dirs as 0o777 and files as 0644 → other (uid) gets read/x.
-            // Non-root (e.g. host-side unit tests) skips this — runCommand will
-            // pick runCommandSimple instead, which runs as the inheriting UID.
+            // sandboxed child can chdir into it. Sub-paths stay root-owned but
+            // get the slot UID write access via mode bits (process-wide umask=0
+            // set in `main` keeps copyDirRecursive's 0o777 intact); that's
+            // enough for build tools that scribble into pre-restored sub-dirs
+            // like .NET's `obj/`, cargo's `target/`, etc. Non-root (e.g.
+            // host-side unit tests) skips this — runCommand picks
+            // runCommandSimple instead, which runs as the inheriting UID.
             try chownAbsolute(gpa, target_path, uid);
         }
 

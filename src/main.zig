@@ -1457,7 +1457,10 @@ const target_audit_arch: u32 = switch (builtin.cpu.arch) {
 /// kexec*, *_module, keyctl, perf_event_open, process_vm_*, *_handle_at) plus
 /// `seccomp` itself so the filter can't be replaced. `prctl` is intentionally
 /// allowed — language runtimes use it and PR_SET_SECCOMP can only narrow.
-const denied_syscall_names = [_][]const u8{
+// Syscalls denied with RET_KILL_PROCESS: container-escape / kernel-manipulation
+// primitives that no legitimate user program should attempt. Hitting one is a
+// strong signal of a compromise attempt, so we drop the whole process.
+const denied_kill_syscall_names = [_][]const u8{
     "mount",          "umount2",         "pivot_root",       "chroot",
     "unshare",        "setns",
     "seccomp",        "bpf",
@@ -1472,14 +1475,24 @@ const denied_syscall_names = [_][]const u8{
     "iopl",           "ioperm",
     "name_to_handle_at", "open_by_handle_at",
     "lookup_dcookie", "nfsservctl",
-    "io_uring_setup", "io_uring_enter",   "io_uring_register",
     "personality",
 };
 
-const denied_syscall_nrs: []const u32 = blk: {
+// Syscalls denied with RET_ERRNO=EPERM: runtimes opportunistically probe for
+// these and gracefully fall back when they fail. RET_KILL_PROCESS here would
+// silently SIGSYS the whole process before its fallback runs — observed with
+// Node 25's libuv 1.51, which calls `io_uring_setup` at init regardless of
+// UV_USE_IO_URING and dies on the kill. EPERM lets libuv detect "io_uring
+// unavailable" and pick epoll instead; the user code can't actually use
+// io_uring because the syscall still fails.
+const denied_errno_syscall_names = [_][]const u8{
+    "io_uring_setup", "io_uring_enter", "io_uring_register",
+};
+
+const denied_kill_syscall_nrs: []const u32 = blk: {
     @setEvalBranchQuota(20_000);
     var list: []const u32 = &.{};
-    for (denied_syscall_names) |name| {
+    for (denied_kill_syscall_names) |name| {
         if (@hasField(linux.SYS, name)) {
             list = list ++ &[_]u32{@intFromEnum(@field(linux.SYS, name))};
         }
@@ -1487,10 +1500,23 @@ const denied_syscall_nrs: []const u32 = blk: {
     break :blk list;
 };
 
-const seccomp_program: [4 + denied_syscall_nrs.len * 2 + 1]SockFilter = blk: {
+const denied_errno_syscall_nrs: []const u32 = blk: {
+    @setEvalBranchQuota(20_000);
+    var list: []const u32 = &.{};
+    for (denied_errno_syscall_names) |name| {
+        if (@hasField(linux.SYS, name)) {
+            list = list ++ &[_]u32{@intFromEnum(@field(linux.SYS, name))};
+        }
+    }
+    break :blk list;
+};
+
+const seccomp_program_len: usize = 4 + denied_kill_syscall_nrs.len * 2 + denied_errno_syscall_nrs.len * 2 + 1;
+
+const seccomp_program: [seccomp_program_len]SockFilter = blk: {
     const arch_offset: u32 = @offsetOf(linux.SECCOMP.data, "arch");
     const nr_offset: u32 = @offsetOf(linux.SECCOMP.data, "nr");
-    var prog: [4 + denied_syscall_nrs.len * 2 + 1]SockFilter = undefined;
+    var prog: [seccomp_program_len]SockFilter = undefined;
     // [0] load arch
     prog[0] = bpfStmt(BPF_LD | BPF_W | BPF_ABS, arch_offset);
     // [1] arch match? jt=1 jumps over the KILL at [2] (to LD nr at [3]).
@@ -1500,10 +1526,16 @@ const seccomp_program: [4 + denied_syscall_nrs.len * 2 + 1]SockFilter = blk: {
     // [3] load syscall number
     prog[3] = bpfStmt(BPF_LD | BPF_W | BPF_ABS, nr_offset);
     var idx: usize = 4;
-    for (denied_syscall_nrs) |nr| {
-        // jt=0 (fall through to RET KILL on match), jf=1 (skip KILL on miss).
+    for (denied_kill_syscall_nrs) |nr| {
+        // jt=0 (fall through to RET on match), jf=1 (skip RET on miss).
         prog[idx] = bpfJump(BPF_JMP | BPF_JEQ | BPF_K, nr, 0, 1);
         prog[idx + 1] = bpfStmt(BPF_RET | BPF_K, linux.SECCOMP.RET.KILL_PROCESS);
+        idx += 2;
+    }
+    for (denied_errno_syscall_nrs) |nr| {
+        prog[idx] = bpfJump(BPF_JMP | BPF_JEQ | BPF_K, nr, 0, 1);
+        // ERRNO|1 = EPERM. The low 16 bits of the RET value are returned as errno.
+        prog[idx + 1] = bpfStmt(BPF_RET | BPF_K, linux.SECCOMP.RET.ERRNO | 1);
         idx += 2;
     }
     prog[idx] = bpfStmt(BPF_RET | BPF_K, linux.SECCOMP.RET.ALLOW);

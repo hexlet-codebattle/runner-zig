@@ -107,7 +107,11 @@ On Linux when running as root (the production deployment), each `/run` request i
 
 **Environment.** Only an explicit allowlist of keys is passed to `execve` (see `RUN_ENV_ALLOW` above). Operator-injected secrets like `DB_PASSWORD` or `API_KEY` never reach user code. `HOME` is force-set to `/sandbox`.
 
-**Seccomp-bpf denylist.** Installed in the inner child after `PR_SET_NO_NEW_PRIVS` and before `execve`. Verdict is `SECCOMP_RET_KILL_PROCESS` for any of: `mount`, `umount2`, `pivot_root`, `chroot`, `unshare`, `setns`, `seccomp`, `bpf`, `keyctl`, `add_key`, `request_key`, `init_module`, `finit_module`, `delete_module`, `kexec_load`, `kexec_file_load`, `swapon`, `swapoff`, `reboot`, `acct`, `quotactl`, `perf_event_open`, `ptrace`, `process_vm_readv`, `process_vm_writev`, `kcmp`, `userfaultfd`, `iopl`, `ioperm`, `name_to_handle_at`, `open_by_handle_at`, `lookup_dcookie`, `nfsservctl`, `io_uring_setup`, `io_uring_enter`, `io_uring_register`, `personality`. Filter starts with an arch audit that kills the process on any non-native syscall ABI (blocks 32-bit-compat ABI-confusion attacks).
+**Seccomp-bpf denylist.** Installed in the inner child after `PR_SET_NO_NEW_PRIVS` and before `execve`. Two verdicts:
+- `SECCOMP_RET_KILL_PROCESS` (drop the process) for the container-escape / kernel-manipulation primitives: `mount`, `umount2`, `pivot_root`, `chroot`, `unshare`, `setns`, `seccomp`, `bpf`, `keyctl`, `add_key`, `request_key`, `init_module`, `finit_module`, `delete_module`, `kexec_load`, `kexec_file_load`, `swapon`, `swapoff`, `reboot`, `acct`, `quotactl`, `perf_event_open`, `ptrace`, `process_vm_readv`, `process_vm_writev`, `kcmp`, `userfaultfd`, `iopl`, `ioperm`, `name_to_handle_at`, `open_by_handle_at`, `lookup_dcookie`, `nfsservctl`, `personality`.
+- `SECCOMP_RET_ERRNO=EPERM` (fail the syscall, keep the process) for `io_uring_setup`, `io_uring_enter`, `io_uring_register`. Modern runtimes (e.g. Node 25's libuv 1.51) probe io_uring at init and fall back to epoll on EPERM; a KILL_PROCESS verdict here silently SIGSYS-kills them before the fallback runs. EPERM still prevents user code from using io_uring as a seccomp-bypass primitive, so the security property is preserved.
+
+Filter starts with an arch audit that kills the process on any non-native syscall ABI (blocks 32-bit-compat ABI-confusion attacks).
 
 **Rlimits applied in the inner child:**
 - `RLIMIT_CPU`: equals the request timeout (rounded up to whole seconds).

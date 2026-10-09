@@ -51,6 +51,8 @@ const all_langs = [_]LangConfig{
     // Native compiles.
     .{ .slug = "cpp",     .dir = "check", .solution = "solution.cpp", .checker = "checker.cpp",    .checker_required = true,  .tmp_size = "512m" },
     .{ .slug = "zig",     .dir = "check", .solution = "solution.zig", .checker = "checker.zig",    .checker_required = true,  .tmp_size = "128m" },
+    // D via ldc2: object files and the checker binary go to /tmp.
+    .{ .slug = "dlang",   .dir = "check", .solution = "solution.d",   .checker = "checker.d",      .checker_required = true,  .tmp_size = "256m" },
     .{ .slug = "rust",    .dir = "check", .solution = "solution.rs",  .checker = "checker.rs",     .checker_required = true,  .tmp_size = "256m" },
     .{ .slug = "swift",   .dir = "check", .solution = "solution.swift", .checker = "checker.swift",.checker_required = true,  .tmp_size = "256m" },
     .{ .slug = "haskell", .dir = "check", .solution = "Solution.hs",  .checker = "Checker.hs",     .checker_required = true,  .tmp_size = "256m" },

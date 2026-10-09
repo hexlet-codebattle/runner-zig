@@ -12,7 +12,7 @@ Request JSON:
 - `timeout` (optional string): Execution limit, e.g. `"30s"`. Defaults to 30 seconds.
 - `solution_text` (string): Source code to run.
 - `lang_slug` (string): Language identifier. Supported values:
-  - `clojure`, `cpp`, `csharp`, `dart`, `elixir`, `golang`, `haskell`, `java`, `js`, `kotlin`, `php`, `python`, `ruby`, `rust`, `swift`, `ts`, `zig`
+  - `clojure`, `cpp`, `csharp`, `dart`, `dlang`, `elixir`, `golang`, `haskell`, `java`, `js`, `kotlin`, `php`, `python`, `ruby`, `rust`, `swift`, `ts`, `zig`
 - `asserts` (optional string): JSON test data, stored as `asserts.json`.
 - `checker_text` (optional string): Checker code. Required for:
   - `cpp`, `csharp`, `dart`, `java`, `golang`, `haskell`, `kotlin`, `rust`, `swift`, `zig`
@@ -82,7 +82,7 @@ Environment variables:
 - Per-lang defaults (when neither env above is set) are baked into `all_langs` in `src/main.zig`. Current values:
   - **Popular langs (generous):** python 256m, cpp 512m, golang 512m, java 256m.
   - Other interpreted (js, ts, ruby, php): 64m.
-  - Other native (zig, dart): 128m. JVM family (kotlin, clojure) and Rust/Swift/Haskell/Elixir: 256m.
+  - Other native (zig, dart): 128m. JVM family (kotlin, clojure) and Rust/Swift/Haskell/Elixir/D (dlang): 256m.
   - csharp: 1g.
 
 ## Timeout Rules

@@ -42,7 +42,8 @@ test-leak:
 	RUNNER_RSS_BULK=10000 RUNNER_RSS_MAX_KB_PER_REQ=1 RUNNER_RSS_MIN_FLOOR_KB=1024 \
 		zig build test --summary all
 
-## Build alpine + ubuntu images and run the python a+b integration suite against each.
+## Build alpine + ubuntu images and run the python a+b integration suite plus
+## the sandbox isolation checks (scripts/isolation_test.py) against each.
 test-integration:
 	$(CONTAINER) build --file Containerfile --tag $(IMAGE):alpine-it .
 	@$(MAKE) --no-print-directory _run-integration IMG_REF=$(IMAGE):alpine-it FLAVOR=alpine
@@ -80,6 +81,8 @@ _run-integration:
 	ok=$$(seq 1 30 | xargs -n1 -P30 sh -c 'b=$$(curl -sS http://localhost:4040/run -H "content-type: application/json" -d @test-payload.json); printf "%s\n" "$$b"' | grep -c '"exit_code":0,"stdout":"5\\n","stderr":""'); \
 	printf '  %d/30 returned the expected body\n' "$$ok"; \
 	[ "$$ok" = "30" ] || pass=0; \
+	echo "-- isolation checks --"; \
+	python3 scripts/isolation_test.py http://localhost:4040 || pass=0; \
 	echo "---- container logs (tail 40) ----"; \
 	$(CONTAINER) logs --tail 40 $$container_name 2>&1 | tail -40; \
 	[ "$$pass" = "1" ] || { echo "==== FAIL ($(FLAVOR)) ===="; exit 1; }; \

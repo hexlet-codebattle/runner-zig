@@ -16,9 +16,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     const run_step = b.step("run", "Run the HTTP service");
     run_step.dependOn(&run_cmd.step);
@@ -31,6 +29,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_tests = b.addRunArtifact(tests);
+    // The integration tests spawn zig-out/bin/runner-zig, which is not an
+    // input the run step can see: build it first and never serve cached results.
+    run_tests.step.dependOn(b.getInstallStep());
+    run_tests.has_side_effects = true;
     const test_step = b.step("test", "Run integration tests");
     test_step.dependOn(&run_tests.step);
 }

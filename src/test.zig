@@ -26,12 +26,12 @@ const LangSpec = struct {
 const python_spec: LangSpec = .{
     .lang_slug = "python",
     .solution_text =
-        \\import json
-        \\with open('asserts.json') as f:
-        \\    data = json.load(f)
-        \\for c in data:
-        \\    print(c['a'] + c['b'])
-        \\
+    \\import json
+    \\with open('asserts.json') as f:
+    \\    data = json.load(f)
+    \\for c in data:
+    \\    print(c['a'] + c['b'])
+    \\
     ,
     .asserts = "[{\"a\":2,\"b\":3}]",
     .expected_stdout = "5\n",
@@ -41,10 +41,10 @@ const python_spec: LangSpec = .{
 const js_spec: LangSpec = .{
     .lang_slug = "js",
     .solution_text =
-        \\const fs = require('fs');
-        \\const data = JSON.parse(fs.readFileSync('asserts.json', 'utf8'));
-        \\for (const c of data) console.log(c.a + c.b);
-        \\
+    \\const fs = require('fs');
+    \\const data = JSON.parse(fs.readFileSync('asserts.json', 'utf8'));
+    \\for (const c of data) console.log(c.a + c.b);
+    \\
     ,
     .asserts = "[{\"a\":2,\"b\":3}]",
     .expected_stdout = "5\n",
@@ -54,10 +54,10 @@ const js_spec: LangSpec = .{
 const ruby_spec: LangSpec = .{
     .lang_slug = "ruby",
     .solution_text =
-        \\require 'json'
-        \\data = JSON.parse(File.read('asserts.json'))
-        \\data.each { |c| puts c['a'] + c['b'] }
-        \\
+    \\require 'json'
+    \\data = JSON.parse(File.read('asserts.json'))
+    \\data.each { |c| puts c['a'] + c['b'] }
+    \\
     ,
     .asserts = "[{\"a\":2,\"b\":3}]",
     .expected_stdout = "5\n",
@@ -67,20 +67,20 @@ const ruby_spec: LangSpec = .{
 const zig_spec: LangSpec = .{
     .lang_slug = "zig",
     .solution_text =
-        \\pub fn solution(a: i64, b: i64) i64 {
-        \\    return a + b;
-        \\}
+    \\pub fn solution(a: i64, b: i64) i64 {
+    \\    return a + b;
+    \\}
     ,
     .checker_text =
-        \\const std = @import("std");
-        \\const solution = @import("solution.zig");
-        \\
-        \\pub fn main(init: std.process.Init) !void {
-        \\    const got = solution.solution(2, 3);
-        \\    var buf: [32]u8 = undefined;
-        \\    const slice = try std.fmt.bufPrint(&buf, "{d}\n", .{got});
-        \\    try std.Io.File.stdout().writeStreamingAll(init.io, slice);
-        \\}
+    \\const std = @import("std");
+    \\const solution = @import("solution.zig");
+    \\
+    \\pub fn main(init: std.process.Init) !void {
+    \\    const got = solution.solution(2, 3);
+    \\    var buf: [32]u8 = undefined;
+    \\    const slice = try std.fmt.bufPrint(&buf, "{d}\n", .{got});
+    \\    try std.Io.File.stdout().writeStreamingAll(init.io, slice);
+    \\}
     ,
     .expected_stdout = "5\n",
     .probe_cmd = "zig",
@@ -228,6 +228,138 @@ test "run rejects unsupported language" {
     try std.testing.expectEqual(@as(u16, 400), response.status);
 }
 
+test "run rejects overflowing and malformed timeouts without crashing" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const port = try pickFreePort(io);
+    var proc = try startServer(allocator, io, port, .{});
+    defer stopServer(allocator, io, port, &proc);
+
+    try waitForHealth(allocator, io, port);
+
+    // An unchecked `value * unit_ns` used to panic (abort in ReleaseSafe) here.
+    for ([_][]const u8{ "99999999999999999m", "abc", "0s", "5" }) |timeout| {
+        const payload = .{ .timeout = timeout, .solution_text = "print(1)", .lang_slug = "python" };
+        const body = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+        defer allocator.free(body);
+        const response = try httpRequest(allocator, io, port, "POST", "/run", body);
+        defer allocator.free(response.body);
+        try std.testing.expectEqual(@as(u16, 400), response.status);
+    }
+    try expectHealthy(allocator, io, port);
+}
+
+test "run rejects malformed json with 400" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const port = try pickFreePort(io);
+    var proc = try startServer(allocator, io, port, .{});
+    defer stopServer(allocator, io, port, &proc);
+
+    try waitForHealth(allocator, io, port);
+
+    const response = try httpRequest(allocator, io, port, "POST", "/run", "not json");
+    defer allocator.free(response.body);
+    try std.testing.expectEqual(@as(u16, 400), response.status);
+}
+
+test "post without content-length does not crash the server" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const port = try pickFreePort(io);
+    var proc = try startServer(allocator, io, port, .{});
+    defer stopServer(allocator, io, port, &proc);
+
+    try waitForHealth(allocator, io, port);
+
+    // std.http.Server asserts on a POST with neither Content-Length nor
+    // Transfer-Encoding; std.http.Client always sends one, so go raw.
+    const address: Io.net.IpAddress = try .parse("127.0.0.1", port);
+    const stream = try address.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var write_buf: [256]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    try writer.interface.writeAll("POST /nope HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    try writer.interface.flush();
+    var read_buf: [1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    const status_line = try reader.interface.takeDelimiterInclusive('\n');
+    try std.testing.expect(std.mem.startsWith(u8, status_line, "HTTP/1.1 404"));
+
+    try expectHealthy(allocator, io, port);
+}
+
+test "run returns valid json for non-utf8 output" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    if (!hasToolchain(allocator, io, python_spec.probe_cmd)) return error.SkipZigTest;
+
+    const port = try pickFreePort(io);
+    var proc = try startServer(allocator, io, port, .{});
+    defer stopServer(allocator, io, port, &proc);
+
+    try waitForHealth(allocator, io, port);
+
+    const payload = .{
+        .solution_text = "import sys; sys.stdout.buffer.write(b'\\xff ok')",
+        .lang_slug = "python",
+    };
+    const body = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+    defer allocator.free(body);
+    const response = try httpRequest(allocator, io, port, "POST", "/run", body);
+    defer allocator.free(response.body);
+    try std.testing.expectEqual(@as(u16, 200), response.status);
+
+    var parsed = try std.json.parseFromSlice(RunResponse, allocator, response.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("\u{FFFD} ok", parsed.value.stdout);
+}
+
+test "workspace cleanup survives deeply nested directories" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    if (!hasToolchain(allocator, io, python_spec.probe_cmd)) return error.SkipZigTest;
+
+    const port = try pickFreePort(io);
+    var proc = try startServer(allocator, io, port, .{});
+    defer stopServer(allocator, io, port, &proc);
+
+    try waitForHealth(allocator, io, port);
+
+    // The old recursive cleanup overflowed its 64 KiB thread stack at ~30
+    // levels, killing the server after the response had been sent.
+    const payload = .{
+        .solution_text =
+        \\import os
+        \\for _ in range(2000):
+        \\    os.mkdir("d")
+        \\    os.chdir("d")
+        \\print("ok")
+        \\
+        ,
+        .lang_slug = "python",
+    };
+    const body = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+    defer allocator.free(body);
+    const response = try httpRequest(allocator, io, port, "POST", "/run", body);
+    defer allocator.free(response.body);
+    try std.testing.expectEqual(@as(u16, 200), response.status);
+
+    io.sleep(.fromNanoseconds(500 * std.time.ns_per_ms), .awake) catch {};
+    try expectHealthy(allocator, io, port);
+}
+
+fn expectHealthy(allocator: std.mem.Allocator, io: Io, port: u16) !void {
+    const response = try httpRequest(allocator, io, port, "GET", "/health", "");
+    defer allocator.free(response.body);
+    try std.testing.expectEqual(@as(u16, 200), response.status);
+}
+
 test "run handles concurrent load" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -330,7 +462,7 @@ test "server rss does not grow under sustained load" {
 /// Returns the runner process's resident set size in KB. Uses `ps`, which
 /// works the same on macOS and Linux.
 fn readRssKb(allocator: std.mem.Allocator, io: Io, pid: std.posix.pid_t) !usize {
-    const pid_str = try std.fmt.allocPrint(allocator, "{d}", .{pid});
+    const pid_str = try allocator.print("{d}", .{pid});
     defer allocator.free(pid_str);
 
     const result = try std.process.run(allocator, io, .{
@@ -353,7 +485,7 @@ fn httpRequest(allocator: std.mem.Allocator, io: Io, port: u16, method: []const 
     var client: std.http.Client = .{ .allocator = allocator, .io = io };
     defer client.deinit();
 
-    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}{s}", .{ port, path });
+    const url = try allocator.print("http://127.0.0.1:{d}{s}", .{ port, path });
     defer allocator.free(url);
 
     const method_enum = if (std.mem.eql(u8, method, "POST")) std.http.Method.POST else std.http.Method.GET;
@@ -377,7 +509,7 @@ fn httpRequest(allocator: std.mem.Allocator, io: Io, port: u16, method: []const 
     var transfer_buf: [8 * 1024]u8 = undefined;
     const reader = response.reader(&transfer_buf);
     const res_body = try reader.allocRemaining(allocator, .limited(2 << 20));
-    return .{ .status = @intFromEnum(response.head.status), .body = res_body };
+    return .{ .status = @backingInt(response.head.status), .body = res_body };
 }
 
 fn waitForHealth(allocator: std.mem.Allocator, io: Io, port: u16) !void {
@@ -470,15 +602,15 @@ fn startServer(allocator: std.mem.Allocator, io: Io, port: u16, options: ServerO
     var env: Environ.Map = .init(allocator);
     errdefer env.deinit();
 
-    const port_text = try std.fmt.allocPrint(allocator, "{d}", .{port});
+    const port_text = try allocator.print("{d}", .{port});
     defer allocator.free(port_text);
     try env.put("PORT", port_text);
     try env.put("ALLOW_SHUTDOWN", "true");
-    const output_max_text = try std.fmt.allocPrint(allocator, "{d}", .{options.output_max});
+    const output_max_text = try allocator.print("{d}", .{options.output_max});
     defer allocator.free(output_max_text);
-    const input_max_text = try std.fmt.allocPrint(allocator, "{d}", .{options.input_max});
+    const input_max_text = try allocator.print("{d}", .{options.input_max});
     defer allocator.free(input_max_text);
-    const concurrency_text = try std.fmt.allocPrint(allocator, "{d}", .{options.run_concurrency});
+    const concurrency_text = try allocator.print("{d}", .{options.run_concurrency});
     defer allocator.free(concurrency_text);
     try env.put("RUN_INPUT_MAX", input_max_text);
     try env.put("RUN_OUTPUT_MAX", output_max_text);
@@ -531,7 +663,7 @@ fn waitForExit(io: Io, pid: std.posix.pid_t, timeout_ns: u64) bool {
     while (true) {
         const elapsed: i128 = @as(i128, @intCast(Io.Timestamp.now(io, .awake).nanoseconds)) - @as(i128, @intCast(start.nanoseconds));
         if (elapsed >= limit_ns) return false;
-        std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
+        std.posix.kill(pid, @fromBackingInt(@intCast(0))) catch |err| switch (err) {
             error.ProcessNotFound => return true,
             error.PermissionDenied => return true,
             else => {},
